@@ -1,0 +1,368 @@
+use std::path::{Path, PathBuf};
+
+use chrono::{Datelike, TimeZone, Utc};
+use duckdb::params;
+use serde::{Deserialize, Serialize};
+
+use crate::error::MuObserveError;
+use crate::storage::hot_duckdb::HotDuckDbStore;
+use crate::storage::views::{escape_sql_literal, register_unified_views};
+use crate::DEFAULT_HOT_RETENTION_DAYS;
+
+/// Configuration for the background Hive-partitioned Zstd Parquet compactor and TTL enforcer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactorConfig {
+    pub parquet_root: PathBuf,
+    pub hot_retention_days: u32,
+    pub raw_telemetry_ttl_days: u32,
+}
+
+impl CompactorConfig {
+    /// Creates a new [`CompactorConfig`] with the default 7-day hot retention window and 60-day
+    /// raw debug log/span TTL (clamped to the policy range of `30..=90` days).
+    pub fn new(parquet_root: impl Into<PathBuf>) -> Self {
+        Self {
+            parquet_root: parquet_root.into(),
+            hot_retention_days: DEFAULT_HOT_RETENTION_DAYS,
+            raw_telemetry_ttl_days: 60,
+        }
+    }
+
+    /// Sets the hot retention days before cold Parquet compaction.
+    #[must_use]
+    pub fn with_hot_retention_days(mut self, days: u32) -> Self {
+        self.hot_retention_days = days;
+        self
+    }
+
+    /// Sets the TTL in days for raw debug logs/spans/metrics (clamped between 30 and 90 days in production,
+    /// or configurable for tests).
+    #[must_use]
+    pub fn with_raw_telemetry_ttl_days(mut self, days: u32) -> Self {
+        self.raw_telemetry_ttl_days = days;
+        self
+    }
+}
+
+/// Summary of rows exported to cold Zstd Parquet and pruned by a compaction cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionReport {
+    pub exported_logs: u64,
+    pub exported_spans: u64,
+    pub exported_metrics: u64,
+    pub exported_tests: u64,
+    pub exported_benchmarks: u64,
+    pub ttl_pruned_files: u64,
+    pub parquet_files_written: Vec<PathBuf>,
+}
+
+/// Background compactor exporting aged rows (`< cutoff_unix_nano`) from `hot.duckdb` into
+/// Hive-partitioned Zstd Parquet files (`signal=<type>/year=YYYY/month=MM/part-<cutoff>.parquet`),
+/// atomically pruning them from the hot tables, refreshing unified analytical views, and
+/// enforcing TTL on raw telemetry while preserving benchmarks and test runs indefinitely.
+pub struct ParquetCompactor {
+    config: CompactorConfig,
+}
+
+impl ParquetCompactor {
+    /// Constructs a new [`ParquetCompactor`].
+    #[must_use]
+    pub fn new(config: CompactorConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns a reference to the compactor configuration.
+    #[must_use]
+    pub fn config(&self) -> &CompactorConfig {
+        &self.config
+    }
+
+    /// Runs a compaction cycle using the current wall-clock timestamp (`now_unix_nano`).
+    pub fn compact_at_now(
+        &self,
+        store: &HotDuckDbStore,
+        now_unix_nano: i64,
+    ) -> Result<CompactionReport, MuObserveError> {
+        let retention_ns = i64::from(self.config.hot_retention_days)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000_000);
+        let cutoff_unix_nano = now_unix_nano.saturating_sub(retention_ns);
+        let mut report = self.compact_before(store, cutoff_unix_nano)?;
+
+        let ttl_ns = i64::from(self.config.raw_telemetry_ttl_days)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000_000);
+        let ttl_cutoff_nano = now_unix_nano.saturating_sub(ttl_ns);
+        report.ttl_pruned_files = self.enforce_cold_ttl(store, ttl_cutoff_nano)?;
+        Ok(report)
+    }
+
+    /// Exports and atomically prunes all records strictly older than `cutoff_unix_nano` across
+    /// `otel_logs`, `otel_spans`, `otel_metrics`, `test_case_runs`, and `benchmark_runs`.
+    pub fn compact_before(
+        &self,
+        store: &HotDuckDbStore,
+        cutoff_unix_nano: i64,
+    ) -> Result<CompactionReport, MuObserveError> {
+        let mut report = CompactionReport::default();
+        let conn = store.lock_conn()?;
+
+        let signals = [
+            ("otel_logs", "logs", "timestamp_unix_nano"),
+            ("otel_spans", "spans", "start_time_unix_nano"),
+            ("otel_metrics", "metrics", "timestamp_unix_nano"),
+            ("test_case_runs", "tests", "timestamp_unix_nano"),
+            ("benchmark_runs", "benchmarks", "timestamp_unix_nano"),
+        ];
+
+        for (table, signal, ts_col) in signals {
+            let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE {ts_col} < ?1");
+            let eligible: i64 =
+                conn.query_row(&count_sql, params![cutoff_unix_nano], |r| r.get(0))?;
+            if eligible <= 0 {
+                continue;
+            }
+
+            let min_ts_sql =
+                format!("SELECT COALESCE(MIN({ts_col}), ?1) FROM {table} WHERE {ts_col} < ?1");
+            let min_ts: i64 =
+                conn.query_row(&min_ts_sql, params![cutoff_unix_nano], |r| r.get(0))?;
+
+            let dt = Utc.timestamp_nanos(min_ts);
+            let year = dt.year();
+            let month = dt.month();
+
+            let part_dir = self
+                .config
+                .parquet_root
+                .join(format!("signal={signal}"))
+                .join(format!("year={year:04}"))
+                .join(format!("month={month:02}"));
+            std::fs::create_dir_all(&part_dir)?;
+
+            let file_name = format!("part-{cutoff_unix_nano}-{eligible}.parquet");
+            let target_file = part_dir.join(file_name);
+            let escaped_target = escape_sql_literal(&target_file.to_string_lossy());
+
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let copy_sql = format!(
+                "COPY (SELECT * FROM {table} WHERE {ts_col} < {cutoff_unix_nano}) \
+                 TO '{escaped_target}' (FORMAT PARQUET, COMPRESSION ZSTD);"
+            );
+            if let Err(e) = conn.execute_batch(&copy_sql) {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(MuObserveError::DuckDb(e));
+            }
+
+            let delete_sql = format!("DELETE FROM {table} WHERE {ts_col} < ?1");
+            if let Err(e) = conn.execute(&delete_sql, params![cutoff_unix_nano]) {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(MuObserveError::DuckDb(e));
+            }
+            conn.execute_batch("COMMIT;")?;
+
+            let exported_u64 = eligible as u64;
+            match signal {
+                "logs" => report.exported_logs += exported_u64,
+                "spans" => report.exported_spans += exported_u64,
+                "metrics" => report.exported_metrics += exported_u64,
+                "tests" => report.exported_tests += exported_u64,
+                "benchmarks" => report.exported_benchmarks += exported_u64,
+                _ => {}
+            }
+            report.parquet_files_written.push(target_file);
+        }
+
+        register_unified_views(&conn, Some(&self.config.parquet_root))?;
+        Ok(report)
+    }
+
+    /// Enforces TTL on cold raw telemetry (`logs`, `spans`, `metrics`) older than `ttl_cutoff_unix_nano`
+    /// while preserving `benchmarks` and `tests` indefinitely.
+    pub fn enforce_cold_ttl(
+        &self,
+        store: &HotDuckDbStore,
+        ttl_cutoff_unix_nano: i64,
+    ) -> Result<u64, MuObserveError> {
+        let mut pruned = 0u64;
+        let conn = store.lock_conn()?;
+
+        let ttl_signals = [
+            ("logs", "timestamp_unix_nano"),
+            ("spans", "start_time_unix_nano"),
+            ("metrics", "timestamp_unix_nano"),
+        ];
+
+        for (signal, ts_col) in ttl_signals {
+            let signal_dir = self.config.parquet_root.join(format!("signal={signal}"));
+            let files = list_parquet_files(&signal_dir);
+            for file in files {
+                let escaped = escape_sql_literal(&file.to_string_lossy());
+                let max_ts_sql =
+                    format!("SELECT COALESCE(MAX({ts_col}), 0) FROM read_parquet('{escaped}')");
+                let max_ts: i64 = conn.query_row(&max_ts_sql, [], |r| r.get(0)).unwrap_or(0);
+                if max_ts > 0
+                    && max_ts < ttl_cutoff_unix_nano
+                    && std::fs::remove_file(&file).is_ok()
+                {
+                    pruned += 1;
+                }
+            }
+        }
+
+        register_unified_views(&conn, Some(&self.config.parquet_root))?;
+        Ok(pruned)
+    }
+}
+
+fn list_parquet_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return out;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(curr) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&curr) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muobserve_ipc::{BenchmarkRunEntry, OtelLogEntry};
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_parquet_compaction_unified_views_and_ttl_preservation() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("hot.duckdb");
+        let parquet_root = dir.path().join("parquet");
+
+        let store =
+            HotDuckDbStore::open(Some(&db_path), Some(&parquet_root)).expect("open hot duckdb");
+
+        let old_ts = 1_700_000_000_000_000_000i64;
+        let recent_ts = old_ts + (10 * 86_400 * 1_000_000_000i64); // +10 days
+
+        // Insert 1 old log and 1 recent log
+        let logs = vec![
+            OtelLogEntry {
+                timestamp_unix_nano: old_ts,
+                trace_id: "trace-old".into(),
+                span_id: "span-1".into(),
+                severity_number: 5,
+                severity_text: "DEBUG".into(),
+                service_name: "action-runner-worker".into(),
+                node_id: "worker-riscv64".into(),
+                body: "old debug log".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: recent_ts,
+                trace_id: "trace-recent".into(),
+                span_id: "span-2".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "action-runner-worker".into(),
+                node_id: "worker-riscv64".into(),
+                body: "recent info log".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ];
+        store.insert_logs_batch(&logs).expect("insert logs");
+
+        // Insert 1 old benchmark and 1 recent benchmark
+        let benches = vec![
+            BenchmarkRunEntry {
+                job_id: "job-old".into(),
+                repo_key: "lma1980/k3-kernels-rvv".into(),
+                branch_key: "main".into(),
+                commit_sha: "111111".into(),
+                crate_name: "k3-kernels-rvv".into(),
+                bench_name: "gemm_a100".into(),
+                ns_per_iter: 41_000.0,
+                std_dev_ns: 100.0,
+                mad_ns: 60.0,
+                p50_ns: 41_000.0,
+                p95_ns: 41_200.0,
+                p99_ns: 41_300.0,
+                throughput_value: None,
+                throughput_unit: None,
+                arch: "riscv64gc".into(),
+                cpu_cluster: "A100".into(),
+                vlen_bits: 1024,
+                timestamp_unix_nano: old_ts,
+                node_id: "worker-riscv64".into(),
+            },
+            BenchmarkRunEntry {
+                job_id: "job-recent".into(),
+                repo_key: "lma1980/k3-kernels-rvv".into(),
+                branch_key: "main".into(),
+                commit_sha: "222222".into(),
+                crate_name: "k3-kernels-rvv".into(),
+                bench_name: "gemm_a100".into(),
+                ns_per_iter: 41_100.0,
+                std_dev_ns: 100.0,
+                mad_ns: 60.0,
+                p50_ns: 41_100.0,
+                p95_ns: 41_300.0,
+                p99_ns: 41_400.0,
+                throughput_value: None,
+                throughput_unit: None,
+                arch: "riscv64gc".into(),
+                cpu_cluster: "A100".into(),
+                vlen_bits: 1024,
+                timestamp_unix_nano: recent_ts,
+                node_id: "worker-riscv64".into(),
+            },
+        ];
+        store
+            .insert_benchmark_runs_batch(&benches)
+            .expect("insert benches");
+
+        let compactor = ParquetCompactor::new(
+            CompactorConfig::new(&parquet_root)
+                .with_hot_retention_days(7)
+                .with_raw_telemetry_ttl_days(60),
+        );
+
+        let report = compactor
+            .compact_at_now(&store, recent_ts)
+            .expect("compact at recent_ts");
+        assert_eq!(report.exported_logs, 1);
+        assert_eq!(report.exported_benchmarks, 1);
+        assert_eq!(report.parquet_files_written.len(), 2);
+
+        // Hot tables now only have 1 row each (recent)
+        assert_eq!(store.count_rows("otel_logs").unwrap(), 1);
+        assert_eq!(store.count_rows("benchmark_runs").unwrap(), 1);
+
+        // Unified views seamlessly combine hot (1) + cold Parquet (1) = 2 rows with zero row loss!
+        assert_eq!(store.count_rows("v_logs").unwrap(), 2);
+        assert_eq!(store.count_rows("v_benchmarks").unwrap(), 2);
+
+        // Now advance past 60-day TTL for raw logs: old_ts should be pruned from v_logs,
+        // while v_benchmarks MUST preserve both rows indefinitely!
+        let ttl_prune_cutoff = old_ts + 1_000;
+        let pruned_files = compactor
+            .enforce_cold_ttl(&store, ttl_prune_cutoff)
+            .expect("enforce cold ttl");
+        assert_eq!(pruned_files, 1);
+        assert_eq!(store.count_rows("v_logs").unwrap(), 1);
+        assert_eq!(store.count_rows("v_benchmarks").unwrap(), 2);
+    }
+}
