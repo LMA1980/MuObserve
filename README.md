@@ -1,5 +1,20 @@
 # MuObserve
 
+<p align="center">
+  <a href="https://hook.lma1980.duckdns.org/jobs">
+    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/MuObserve/card.svg" alt="MuObserve Factory Scorecard" width="520"/>
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuObserve/status.svg" alt="CI Status"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuObserve/score.svg" alt="Quality Score"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuObserve/coverage.svg" alt="Coverage"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuObserve/benchmark.svg" alt="Benchmark"/></a>
+</p>
+
+---
+
 Distributed **OpenTelemetry (OTEL) + DuckDB/Parquet** observability backend, centralized `ActionRunner-controller` state store, hardware-aware benchmark & test regression analytics engine, and **Antigravity Model Context Protocol (MCP) server**.
 
 ## Architectural Scope
