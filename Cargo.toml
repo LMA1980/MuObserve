@@ -1,0 +1,11 @@
+[package]
+name = "muobserve"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed OTEL + DuckDB/Parquet observability backend, centralized CI state store, hardware-aware benchmark/test regression engine, and Antigravity MCP server"
+license = "AGPL-3.0-only"
+repository = "https://github.com/LMA1980/MuObserve"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
