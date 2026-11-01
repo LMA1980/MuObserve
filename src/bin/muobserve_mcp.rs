@@ -4,8 +4,10 @@ use muobserve::{HotDuckDbStore, McpServer};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut db_path: Option<PathBuf> = None;
-    let mut parquet_root: Option<PathBuf> = None;
+    let mut db_path: Option<PathBuf> = std::env::var("MUOBSERVE_DB_PATH").ok().map(PathBuf::from);
+    let mut parquet_root: Option<PathBuf> = std::env::var("MUOBSERVE_PARQUET_ROOT")
+        .ok()
+        .map(PathBuf::from);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {

@@ -39,7 +39,24 @@ impl HotDuckDbStore {
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                Connection::open(p)?
+                match Connection::open(p) {
+                    Ok(c) => c,
+                    Err(e) if p.exists() => {
+                        let snap = std::env::temp_dir().join(format!(
+                            "muobserve-ro-{}-{}.duckdb",
+                            std::process::id(),
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                        ));
+                        std::fs::copy(p, &snap)?;
+                        let wal_src = PathBuf::from(format!("{}.wal", p.display()));
+                        if wal_src.exists() {
+                            let wal_dst = PathBuf::from(format!("{}.wal", snap.display()));
+                            let _ = std::fs::copy(&wal_src, &wal_dst);
+                        }
+                        Connection::open(&snap).map_err(|_| e)?
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             None => Connection::open_in_memory()?,
         };
@@ -273,6 +290,9 @@ impl HotDuckDbStore {
         }
         drop(stmt);
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(count)
     }
 
@@ -320,6 +340,9 @@ impl HotDuckDbStore {
         }
         drop(stmt);
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(count)
     }
 
@@ -371,6 +394,9 @@ impl HotDuckDbStore {
         }
         drop(stmt);
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(count)
     }
 
@@ -421,6 +447,9 @@ impl HotDuckDbStore {
         }
         drop(stmt);
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(count)
     }
 
@@ -478,6 +507,9 @@ impl HotDuckDbStore {
         }
         drop(stmt);
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(count)
     }
 
@@ -603,6 +635,9 @@ impl HotDuckDbStore {
         }
 
         conn.execute_batch("COMMIT;")?;
+        if self.db_path.is_some() {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
         Ok(total)
     }
 
