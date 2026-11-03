@@ -727,6 +727,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_all_10_mcp_tools_and_ddl_dml_sql_rejection() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let now_ts = 1_700_000_000_000_000_000i64;

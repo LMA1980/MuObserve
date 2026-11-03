@@ -167,6 +167,7 @@ mod tests {
     use muobserve_ipc::{OtelLogEntry, OtelSpanEntry};
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_canary_slo_evaluation_healthy_and_breach_taint_recommendation() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let now_ts = 1_700_000_100_000_000_000i64;

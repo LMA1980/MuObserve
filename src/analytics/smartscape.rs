@@ -842,6 +842,7 @@ mod tests {
     use muobserve_ipc::{OtelLogEntry, OtelSpanEntry};
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_smartscape_3_layer_topology_and_problems_detection() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let now_ts = 1_700_000_100_000_000_000i64;

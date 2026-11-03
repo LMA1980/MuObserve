@@ -832,6 +832,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_hot_duckdb_crud_and_arrow_ingestion() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
 
@@ -937,6 +938,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_sql_injection_immunity_in_parameterized_inserts_and_queries() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let malicious_payload = "'); DROP TABLE jobs_history; --";

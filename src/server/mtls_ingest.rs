@@ -630,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_san_extraction_and_spoofing_rejection() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let cert_der = generate_client_cert_with_sans(
@@ -698,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_fory_ci_state_crud_and_muisolation_sandbox_plan() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let attr = SanAttribution {

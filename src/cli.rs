@@ -399,6 +399,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_migrate_actionrunner_lossless_duckdb_import_and_cli_subcommands() {
         let dir = tempdir().expect("tempdir");
         let legacy_db_path = dir.path().join("actionrunner.duckdb");

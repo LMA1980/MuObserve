@@ -784,6 +784,7 @@ mod tests {
     use muobserve_ipc::{OtelLogEntry, OtelMetricEntry, OtelSpanEntry};
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_purepath_waterfall_critical_path_self_time_and_3_pillar_correlation() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let base_ts = 1_700_000_000_000_000_000i64;

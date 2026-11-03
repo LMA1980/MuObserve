@@ -397,6 +397,7 @@ mod tests {
     use muobserve_ipc::{BenchmarkRunEntry, TestCaseRunEntry};
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_hardware_stratified_x100_vs_a100_regression_isolation() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let base_ts = 1_700_000_000_000_000_000i64;
@@ -527,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_rolling_30_day_test_flakiness_and_gate_report() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let base_ts = 1_700_000_000_000_000_000i64;
