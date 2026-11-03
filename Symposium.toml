@@ -1,0 +1,35 @@
+name = "muobserve"
+# Crate-embedded Symposium manifest for muobserve.
+
+[[plugins]]
+depends-on = ["muobserve-ipc"]
+source.cargo = "muobserve-ipc"
+
+[[plugins]]
+depends-on = ["mu-isolation"]
+source.cargo = "mu-isolation"
+
+[[installations]]
+name = "muobserve-cli"
+executable = "muobserve-cli"
+
+[subcommand.muobserve]
+description = "Query MuObserve benchmark regressions, canary SLOs, W3C traces, and guarded DuckDB analytics"
+audience = "agents"
+command = "muobserve-cli"
+predicates = ["path_exists(muobserve-cli)"]
+
+[[mcp_servers]]
+name = "muobserve"
+command = "/usr/local/bin/muobserve-mcp"
+args = [
+    "--db",
+    "/var/lib/muobserve/db/muobserve.duckdb",
+    "--parquet-root",
+    "/var/lib/muobserve/parquet",
+]
+env = [
+    { name = "MUOBSERVE_DB_PATH", value = "/var/lib/muobserve/db/muobserve.duckdb" },
+    { name = "MUOBSERVE_PARQUET_ROOT", value = "/var/lib/muobserve/parquet" },
+]
+predicates = ["path_exists(/usr/local/bin/muobserve-mcp)"]

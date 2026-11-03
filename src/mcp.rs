@@ -672,12 +672,15 @@ impl McpServer {
         Ok(())
     }
 
-    /// Builds an Axum HTTP/SSE router exposing `POST /mcp` (JSON-RPC) and `GET /mcp/sse` (SSE endpoint discovery).
+    /// Builds an Axum HTTP/SSE router exposing `POST /mcp` (JSON-RPC), `GET /mcp/sse` (SSE endpoint discovery),
+    /// and the read-only M6 observability console API (`/api/v1/*`, `/api/v1/console/*`, `/api/observe/*`).
     pub fn router(self) -> Router {
+        let store = self.store.clone();
         Router::new()
             .route("/mcp", post(http_mcp_post_handler))
             .route("/mcp/sse", get(http_mcp_sse_handler))
             .with_state(self)
+            .merge(crate::server::build_console_api_router(store))
     }
 }
 
