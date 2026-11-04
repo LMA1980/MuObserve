@@ -14,8 +14,13 @@ pub mod storage;
 pub const DEFAULT_HOT_RETENTION_DAYS: u32 = 7;
 
 pub use analytics::{
-    compute_test_flakiness, evaluate_benchmark_regressions, evaluate_canary_slo,
-    evaluate_regression_gate, FlakyTestItem,
+    compute_purepath_waterfall, compute_smartscape_topology, compute_test_flakiness,
+    evaluate_benchmark_regressions, evaluate_canary_slo, evaluate_deterministic_problems,
+    evaluate_regression_gate, list_trace_summaries, FlakyTestItem, ProblemCard, ProblemSummary,
+    ProblemsFeedResponse, PurePathLogEntry, PurePathMetricEntry, PurePathResponse,
+    PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode, SmartscapeProcessNode,
+    SmartscapeServiceNode, SmartscapeTopology, TraceListFilter, TraceListQuery, TraceListResponse,
+    TraceSummaryDto, DEFAULT_SMARTSCAPE_WINDOW_SECS,
 };
 pub use cli::{
     execute_cli_command, migrate_actionrunner_duckdb, parse_cli_args, ActionRunnerMigrationReport,
@@ -24,9 +29,15 @@ pub use cli::{
 pub use error::MuObserveError;
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, MCP_TOOL_NAMES};
 pub use server::{
-    build_mtls_server_config, build_sandbox_execution_plan, dispatch_frame, extract_cert_sans,
-    resolve_san_identity, CollectorBatchAck, IngestServerConfig, MtlsIngestServer, SanAttribution,
-    SanEnforcementPolicy, MSG_TYPE_ARROW_LOGS, MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS,
+    alias_internal_hostnames, anonymize_ipv4_rfc5737, build_console_api_router,
+    build_mtls_server_config, build_sandbox_execution_plan, collect_storage_health_status,
+    dispatch_frame, extract_cert_sans, fqdn_to_shortname, mask_ipv4_third_octet,
+    query_sanitized_logs, query_sanitized_metrics, resolve_san_identity, sanitize_console_value,
+    scrub_host_paths, scrub_secrets_and_tokens, trim_path_last_two_segments, ClusterEfficiencyItem,
+    CollectorBatchAck, ConsoleLogItem, IngestServerConfig, LogsQueryResponse,
+    MetricTimeseriesPoint, MetricsTimeseriesResponse, MtlsIngestServer, PrivacyRedactor,
+    SanAttribution, SanEnforcementPolicy, StoreStatusResponse, MSG_TYPE_ARROW_LOGS,
+    MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS,
 };
 pub use sql_guard::{
     execute_guarded_sql, validate_readonly_sql, SqlQueryResult, DEFAULT_SQL_MAX_ROWS,

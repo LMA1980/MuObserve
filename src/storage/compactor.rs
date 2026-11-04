@@ -243,6 +243,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_parquet_compaction_unified_views_and_ttl_preservation() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("hot.duckdb");

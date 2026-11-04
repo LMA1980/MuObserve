@@ -285,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_execute_guarded_sql_row_limit() {
         let store = HotDuckDbStore::open_in_memory().expect("open in memory");
         let res = execute_guarded_sql(
