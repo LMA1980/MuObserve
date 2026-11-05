@@ -762,6 +762,7 @@ impl HotDuckDbStore {
                 latest_completed_job_id, latest_completed_json, latest_completed_queued_us
             FROM submodule_snapshots
             WHERE (?1 IS NULL OR parent_repo_key = ?1)
+              AND (?1 IS NOT NULL OR NOT starts_with(parent_repo_key, '__ar_'))
               AND (?2 IS NULL OR submodule_key = ?2)
               AND (?3 IS NULL OR branch_key = ?3)
             ORDER BY parent_repo_key ASC, branch_key ASC, submodule_key ASC
@@ -986,5 +987,142 @@ mod tests {
             .expect("query jobs");
         assert_eq!(queried.len(), 1);
         assert_eq!(queried[0].job_id, malicious_payload);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_query_submodule_snapshots_excludes_ar_internal_rows_when_unfiltered() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+
+        let legit_repos = vec![
+            "lma1980/k3",
+            "near_protocol",
+            "gear_engine",
+            "bear_claw",
+            "search",
+            "spark",
+            "start",
+            "smart",
+            "learn",
+            "board",
+            "00ar_foo",
+            "star_tracker",
+            "_ar_something",
+            "__ar",
+            "normal-repo/proj",
+            "🦀ar_unicode",
+        ];
+
+        let mut batch = Vec::new();
+        for (idx, repo) in legit_repos.iter().enumerate() {
+            batch.push(CentralSubmoduleSnapshot {
+                parent_repo_key: (*repo).into(),
+                branch_key: "main".into(),
+                submodule_key: format!("sub-{}", idx),
+                submodule_path_key: format!("path/{}", idx),
+                latest_active_job_id: Some(format!("job-{}", idx)),
+                latest_active_json: Some(format!("{{\"stage\":\"build-{}\"}}", idx)),
+                latest_active_queued_us: Some(1_000_000 + idx as i64),
+                latest_completed_job_id: Some(format!("job-prev-{}", idx)),
+                latest_completed_json: Some("{\"status\":\"success\"}".into()),
+                latest_completed_queued_us: Some(900_000 + idx as i64),
+            });
+        }
+
+        let internal_log = CentralSubmoduleSnapshot {
+            parent_repo_key: "__ar_job_logs__".into(),
+            branch_key: "log".into(),
+            submodule_key: "job-100".into(),
+            submodule_path_key: "log".into(),
+            latest_active_job_id: Some("job-100".into()),
+            latest_active_json: Some("raw CI build log chunk...".into()),
+            latest_active_queued_us: Some(1_200_000),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        };
+
+        let internal_lease = CentralSubmoduleSnapshot {
+            parent_repo_key: "__ar_ha_lease__".into(),
+            branch_key: "lease".into(),
+            submodule_key: "leader".into(),
+            submodule_path_key: "lease".into(),
+            latest_active_job_id: None,
+            latest_active_json: Some("{\"leader\":\"node-a\"}".into()),
+            latest_active_queued_us: Some(1_300_000),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        };
+
+        batch.push(internal_log);
+        batch.push(internal_lease);
+
+        store
+            .upsert_ci_state_batch(&[], &[], &batch)
+            .expect("upsert batch");
+
+        // 1. Unfiltered query (parent_repo_key: None) MUST exclude all __ar_* synthetic rows
+        let unfiltered_req = QuerySubmoduleSnapshotsRequest {
+            request_id: "req-unfiltered".into(),
+            parent_repo_key: None,
+            submodule_key: None,
+            branch_key: None,
+        };
+        let unfiltered = store
+            .query_submodule_snapshots(&unfiltered_req)
+            .expect("query unfiltered submodule snapshots");
+
+        let returned_repos: Vec<String> = unfiltered
+            .iter()
+            .map(|r| r.parent_repo_key.clone())
+            .collect();
+
+        assert_eq!(
+            unfiltered.len(),
+            legit_repos.len(),
+            "Unfiltered query must return all legitimate snapshots, excluding __ar_* internal rows. Returned: {:?}",
+            returned_repos
+        );
+
+        for repo in &legit_repos {
+            assert!(
+                returned_repos.contains(&repo.to_string()),
+                "Legitimate repo '{}' was falsely excluded by SQL filter!",
+                repo
+            );
+        }
+
+        // 2. Filtered query explicitly targeting __ar_job_logs__ MUST return the requested internal row
+        let internal_req = QuerySubmoduleSnapshotsRequest {
+            request_id: "req-internal-log".into(),
+            parent_repo_key: Some("__ar_job_logs__".into()),
+            submodule_key: None,
+            branch_key: None,
+        };
+        let internal_results = store
+            .query_submodule_snapshots(&internal_req)
+            .expect("query specific internal submodule snapshots");
+
+        assert_eq!(
+            internal_results.len(),
+            1,
+            "Explicit query for __ar_job_logs__ must succeed and return exactly the requested row"
+        );
+        assert_eq!(internal_results[0].parent_repo_key, "__ar_job_logs__");
+        assert_eq!(internal_results[0].submodule_key, "job-100");
+
+        // 3. Targeted query for near_protocol MUST succeed and return near_protocol
+        let near_req = QuerySubmoduleSnapshotsRequest {
+            request_id: "req-near".into(),
+            parent_repo_key: Some("near_protocol".into()),
+            submodule_key: None,
+            branch_key: None,
+        };
+        let near_results = store
+            .query_submodule_snapshots(&near_req)
+            .expect("query near_protocol snapshots");
+        assert_eq!(near_results.len(), 1);
+        assert_eq!(near_results[0].parent_repo_key, "near_protocol");
     }
 }

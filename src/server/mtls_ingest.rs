@@ -21,7 +21,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use x509_parser::prelude::*;
@@ -556,40 +556,55 @@ impl MtlsIngestServer {
     pub async fn serve(&self, listener: TcpListener) -> Result<(), MuObserveError> {
         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
         loop {
-            let (tcp_stream, _peer_addr): (tokio::net::TcpStream, SocketAddr) =
+            let (tcp_stream, peer_addr): (tokio::net::TcpStream, SocketAddr) =
                 listener.accept().await?;
             let acceptor = acceptor.clone();
             let store = self.store.clone();
             let config = self.config.clone();
 
             tokio::spawn(async move {
-                let Ok(mut tls_stream) = acceptor.accept(tcp_stream).await else {
-                    return;
+                let mut tls_stream = match acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_addr, error = %e, "mTLS handshake failed");
+                        return;
+                    }
                 };
                 let (_, server_conn) = tls_stream.get_ref();
                 let Some(certs) = server_conn.peer_certificates() else {
+                    tracing::warn!(peer = %peer_addr, "mTLS peer did not present client certificates");
+                    let _ = tls_stream.shutdown().await;
                     return;
                 };
                 let Some(leaf_cert) = certs.first() else {
+                    tracing::warn!(peer = %peer_addr, "mTLS peer presented empty client certificate chain");
+                    let _ = tls_stream.shutdown().await;
                     return;
                 };
-                let Ok(attribution) =
-                    resolve_san_identity(leaf_cert.as_ref(), config.allowed_dns_suffix.as_deref())
-                else {
-                    return;
+                let attribution = match resolve_san_identity(
+                    leaf_cert.as_ref(),
+                    config.allowed_dns_suffix.as_deref(),
+                ) {
+                    Ok(attr) => attr,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_addr, error = %e, "mTLS SAN identity resolution failed");
+                        let _ = tls_stream.shutdown().await;
+                        return;
+                    }
                 };
 
                 while let Ok((hdr, payload)) = read_frame(&mut tls_stream).await {
                     match dispatch_frame(&store, &config, &attribution, &hdr, &payload) {
                         Ok((resp_hdr, resp_payload)) => {
-                            if write_frame(&mut tls_stream, &resp_hdr, &resp_payload)
-                                .await
-                                .is_err()
+                            if let Err(e) =
+                                write_frame(&mut tls_stream, &resp_hdr, &resp_payload).await
                             {
+                                tracing::warn!(peer = %peer_addr, error = %e, "Failed to write mTLS frame response");
                                 break;
                             }
                         }
                         Err(e) => {
+                            tracing::warn!(peer = %peer_addr, error = %e, "mTLS frame dispatch error");
                             if let Ok((err_hdr, err_payload)) =
                                 encode_wal_ack_frame(hdr.sequence, 0, false, Some(e.to_string()))
                             {
@@ -599,6 +614,8 @@ impl MtlsIngestServer {
                         }
                     }
                 }
+
+                let _ = tls_stream.shutdown().await;
             });
         }
     }
