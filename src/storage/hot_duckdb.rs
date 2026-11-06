@@ -1,4 +1,6 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::record_batch::RecordBatch;
@@ -14,20 +16,62 @@ use muobserve_ipc::{
 use crate::error::MuObserveError;
 use crate::storage::views::register_unified_views;
 
+const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
+const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
+const MAX_PERSISTED_JOB_LOGS: usize = 100;
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 30_000;
+
+fn now_epoch_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+#[derive(Default)]
+struct WriteBehindCache {
+    /// Ephemeral HA lease snapshots keyed by `(branch_key, submodule_key)`.
+    /// Served in O(1) from RAM without touching DuckDB on every 5s heartbeat.
+    lease_snapshots: BTreeMap<(String, String), CentralSubmoduleSnapshot>,
+    /// Active and recently updated job logs keyed by `(branch_key, submodule_key)`.
+    job_logs: BTreeMap<(String, String), CentralSubmoduleSnapshot>,
+    /// Keys in `job_logs` that have been modified in memory since the last DuckDB flush.
+    dirty_job_logs: BTreeSet<(String, String)>,
+}
+
+impl WriteBehindCache {
+    fn prune_job_logs_to_limit(&mut self, max_entries: usize) {
+        while self.job_logs.len() > max_entries {
+            let oldest_key = self
+                .job_logs
+                .iter()
+                .min_by_key(|(_, snap)| snap.latest_active_queued_us.unwrap_or(0))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest_key {
+                self.job_logs.remove(&k);
+                self.dirty_job_logs.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// Parameterized Hot DuckDB storage engine (`hot.duckdb`) hosting the 7-day OTEL telemetry
 /// tables (`otel_logs`, `otel_spans`, `otel_metrics`), granular CI execution tables
 /// (`test_case_runs`, `benchmark_runs`), and the centralized `ActionRunner-controller` catalog
-/// (`jobs_history`, `branch_snapshots`, `submodule_snapshots`).
+/// (`jobs_history`, `branch_snapshots`, `submodule_snapshots`, `job_logs_store`).
 #[derive(Clone)]
 pub struct HotDuckDbStore {
     conn: Arc<Mutex<Connection>>,
     db_path: Option<PathBuf>,
     parquet_root: Option<PathBuf>,
+    cache: Arc<Mutex<WriteBehindCache>>,
+    dirty_writes: Arc<AtomicU64>,
+    last_flush_ms: Arc<AtomicU64>,
+    flush_interval_ms: u64,
 }
 
 impl HotDuckDbStore {
     /// Opens a file-backed `HotDuckDbStore` at `db_path` (or in-memory if `None`) and initializes
-    /// all 8 canonical tables and analytical views.
+    /// all canonical tables, bounded DuckDB resource pragmas, and analytical views.
     pub fn open(
         db_path: Option<&Path>,
         parquet_root: Option<&Path>,
@@ -61,10 +105,20 @@ impl HotDuckDbStore {
             None => Connection::open_in_memory()?,
         };
 
+        let flush_interval_ms = std::env::var("MUOBSERVE_FLUSH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|s| s.clamp(1, 3600) * 1000)
+            .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
+
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: db_path.map(Path::to_path_buf),
             parquet_root: parquet_root.map(Path::to_path_buf),
+            cache: Arc::new(Mutex::new(WriteBehindCache::default())),
+            dirty_writes: Arc::new(AtomicU64::new(0)),
+            last_flush_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            flush_interval_ms,
         };
         store.init_schema()?;
         store.refresh_views()?;
@@ -110,6 +164,23 @@ impl HotDuckDbStore {
 
     fn init_schema(&self) -> Result<(), MuObserveError> {
         let conn = self.lock_conn()?;
+        if self.db_path.is_some() {
+            let mem_limit = std::env::var("MUOBSERVE_DUCKDB_MEMORY_LIMIT")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "1GB".to_string());
+            let threads: usize = std::env::var("MUOBSERVE_DUCKDB_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(2)
+                .clamp(1, 16);
+            let _ = conn.execute_batch(&format!(
+                "SET memory_limit = '{}'; SET threads = {}; SET allocator_flush_threshold = '16MB'; SET wal_autocheckpoint = '64MB';",
+                mem_limit.replace('\'', ""),
+                threads
+            ));
+        }
+
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS otel_logs (
@@ -250,9 +321,195 @@ impl HotDuckDbStore {
                 latest_completed_queued_us BIGINT,
                 PRIMARY KEY (parent_repo_key, branch_key, submodule_key)
             );
+
+            CREATE TABLE IF NOT EXISTS job_logs_store (
+                branch_key VARCHAR NOT NULL,
+                submodule_key VARCHAR NOT NULL,
+                submodule_path_key VARCHAR NOT NULL,
+                latest_active_job_id VARCHAR,
+                latest_active_json VARCHAR,
+                latest_active_queued_us BIGINT,
+                latest_completed_job_id VARCHAR,
+                latest_completed_json VARCHAR,
+                latest_completed_queued_us BIGINT,
+                PRIMARY KEY (branch_key, submodule_key)
+            );
             "#,
         )?;
+
+        // Hydrate any persisted HA lease rows into the in-memory cache before purging
+        // synthetic __ar_ha_lease__ and __ar_job_logs__ rows from submodule_snapshots.
+        if let Ok(mut stmt) = conn.prepare(
+            r#"
+            SELECT
+                parent_repo_key, branch_key, submodule_key, submodule_path_key,
+                latest_active_job_id, latest_active_json, latest_active_queued_us,
+                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+            FROM submodule_snapshots
+            WHERE parent_repo_key = '__ar_ha_lease__'
+            "#,
+        ) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok(CentralSubmoduleSnapshot {
+                    parent_repo_key: row.get(0)?,
+                    branch_key: row.get(1)?,
+                    submodule_key: row.get(2)?,
+                    submodule_path_key: row.get(3)?,
+                    latest_active_job_id: row.get(4)?,
+                    latest_active_json: row.get(5)?,
+                    latest_active_queued_us: row.get(6)?,
+                    latest_completed_job_id: row.get(7)?,
+                    latest_completed_json: row.get(8)?,
+                    latest_completed_queued_us: row.get(9)?,
+                })
+            }) {
+                if let Ok(mut cache) = self.cache.lock() {
+                    for snap in rows.flatten() {
+                        cache
+                            .lease_snapshots
+                            .insert((snap.branch_key.clone(), snap.submodule_key.clone()), snap);
+                    }
+                }
+            }
+        }
+
+        // Migrate newest job logs from submodule_snapshots into dedicated job_logs_store,
+        // remove __ar_job_logs__ and __ar_ha_lease__ bloat from submodule_snapshots, and prune retention.
+        let migrated_or_purged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM submodule_snapshots WHERE parent_repo_key IN ('__ar_job_logs__', '__ar_ha_lease__')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        if migrated_or_purged > 0 {
+            conn.execute_batch(
+                r#"
+                BEGIN TRANSACTION;
+                INSERT OR REPLACE INTO job_logs_store (
+                    branch_key, submodule_key, submodule_path_key,
+                    latest_active_job_id, latest_active_json, latest_active_queued_us,
+                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                )
+                SELECT
+                    branch_key, submodule_key, submodule_path_key,
+                    latest_active_job_id, latest_active_json, latest_active_queued_us,
+                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                FROM submodule_snapshots
+                WHERE parent_repo_key = '__ar_job_logs__'
+                ORDER BY COALESCE(latest_active_queued_us, 0) DESC
+                LIMIT 100;
+
+                DELETE FROM submodule_snapshots
+                WHERE parent_repo_key IN ('__ar_job_logs__', '__ar_ha_lease__');
+                COMMIT;
+                "#,
+            )?;
+            if self.db_path.is_some() {
+                let _ = conn.execute_batch("CHECKPOINT;");
+            }
+        }
+
         Ok(())
+    }
+
+    /// Flushes dirty in-memory write-behind entries (`__ar_job_logs__`) to `job_logs_store`,
+    /// prunes `job_logs_store` retention to `MAX_PERSISTED_JOB_LOGS`, and executes a DuckDB
+    /// `CHECKPOINT` when `force_checkpoint` is `true` or the delayed flush interval has elapsed.
+    pub fn flush_delayed(&self, force_checkpoint: bool) -> Result<u32, MuObserveError> {
+        let now_ms = now_epoch_ms();
+        let last_ms = self.last_flush_ms.load(Ordering::Relaxed);
+        let interval_elapsed = now_ms.saturating_sub(last_ms) >= self.flush_interval_ms;
+
+        if !force_checkpoint && !interval_elapsed {
+            return Ok(0);
+        }
+
+        let dirty_logs: Vec<CentralSubmoduleSnapshot> = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| MuObserveError::LockPoisoned("WriteBehindCache mutex".into()))?;
+            let keys: Vec<(String, String)> = cache.dirty_job_logs.iter().cloned().collect();
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                if let Some(snap) = cache.job_logs.get(&k) {
+                    out.push(snap.clone());
+                }
+            }
+            cache.dirty_job_logs.clear();
+            cache.prune_job_logs_to_limit(MAX_PERSISTED_JOB_LOGS);
+            out
+        };
+
+        let prior_dirty = self.dirty_writes.swap(0, Ordering::Relaxed);
+        self.last_flush_ms.store(now_ms, Ordering::Relaxed);
+
+        if dirty_logs.is_empty() && prior_dirty == 0 && !force_checkpoint {
+            return Ok(0);
+        }
+
+        let conn = self.lock_conn()?;
+        let mut flushed_count = 0u32;
+
+        if !dirty_logs.is_empty() {
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            {
+                let mut stmt = conn.prepare(
+                    r#"
+                    INSERT OR REPLACE INTO job_logs_store (
+                        branch_key, submodule_key, submodule_path_key,
+                        latest_active_job_id, latest_active_json, latest_active_queued_us,
+                        latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#,
+                )?;
+                for s in &dirty_logs {
+                    stmt.execute(params![
+                        s.branch_key,
+                        s.submodule_key,
+                        s.submodule_path_key,
+                        s.latest_active_job_id,
+                        s.latest_active_json,
+                        s.latest_active_queued_us,
+                        s.latest_completed_job_id,
+                        s.latest_completed_json,
+                        s.latest_completed_queued_us,
+                    ])?;
+                    flushed_count = flushed_count.saturating_add(1);
+                }
+            }
+            let _ = conn.execute(
+                r#"
+                DELETE FROM job_logs_store
+                WHERE (branch_key, submodule_key) NOT IN (
+                    SELECT branch_key, submodule_key
+                    FROM job_logs_store
+                    ORDER BY COALESCE(latest_active_queued_us, 0) DESC
+                    LIMIT ?1
+                )
+                "#,
+                params![MAX_PERSISTED_JOB_LOGS as i64],
+            );
+            conn.execute_batch("COMMIT;")?;
+        }
+
+        if self.db_path.is_some() && (force_checkpoint || !dirty_logs.is_empty() || prior_dirty > 0)
+        {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        }
+
+        Ok(flushed_count)
+    }
+
+    fn record_write_and_maybe_flush(&self) {
+        self.dirty_writes.fetch_add(1, Ordering::Relaxed);
+        let now_ms = now_epoch_ms();
+        let last_ms = self.last_flush_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_ms) >= self.flush_interval_ms {
+            let _ = self.flush_delayed(false);
+        }
     }
 
     /// Inserts a batch of [`OtelLogEntry`] rows using strictly parameterized statements (`?1..`).
@@ -260,39 +517,40 @@ impl HotDuckDbStore {
         if entries.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO otel_logs (
-                timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
-                service_name, node_id, body, attributes_json, job_id, stage_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-        )?;
+        let count = {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut stmt = conn.prepare(
+                r#"
+                INSERT INTO otel_logs (
+                    timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
+                    service_name, node_id, body, attributes_json, job_id, stage_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+            )?;
 
-        let mut count = 0u32;
-        for e in entries {
-            stmt.execute(params![
-                e.timestamp_unix_nano,
-                e.trace_id,
-                e.span_id,
-                e.severity_number,
-                e.severity_text,
-                e.service_name,
-                e.node_id,
-                e.body,
-                e.attributes_json,
-                e.job_id,
-                e.stage_id,
-            ])?;
-            count = count.saturating_add(1);
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
-        }
+            let mut count = 0u32;
+            for e in entries {
+                stmt.execute(params![
+                    e.timestamp_unix_nano,
+                    e.trace_id,
+                    e.span_id,
+                    e.severity_number,
+                    e.severity_text,
+                    e.service_name,
+                    e.node_id,
+                    e.body,
+                    e.attributes_json,
+                    e.job_id,
+                    e.stage_id,
+                ])?;
+                count = count.saturating_add(1);
+            }
+            drop(stmt);
+            conn.execute_batch("COMMIT;")?;
+            count
+        };
+        self.record_write_and_maybe_flush();
         Ok(count)
     }
 
@@ -307,42 +565,43 @@ impl HotDuckDbStore {
         if entries.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO otel_spans (
-                trace_id, span_id, parent_span_id, service_name, node_id,
-                span_name, span_kind, start_time_unix_nano, end_time_unix_nano,
-                duration_ns, status_code, status_message, attributes_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-        )?;
+        let count = {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut stmt = conn.prepare(
+                r#"
+                INSERT INTO otel_spans (
+                    trace_id, span_id, parent_span_id, service_name, node_id,
+                    span_name, span_kind, start_time_unix_nano, end_time_unix_nano,
+                    duration_ns, status_code, status_message, attributes_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )?;
 
-        let mut count = 0u32;
-        for e in entries {
-            stmt.execute(params![
-                e.trace_id,
-                e.span_id,
-                e.parent_span_id,
-                e.service_name,
-                e.node_id,
-                e.span_name,
-                e.span_kind,
-                e.start_time_unix_nano,
-                e.end_time_unix_nano,
-                e.duration_ns as i64,
-                e.status_code,
-                e.status_message,
-                e.attributes_json,
-            ])?;
-            count = count.saturating_add(1);
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
-        }
+            let mut count = 0u32;
+            for e in entries {
+                stmt.execute(params![
+                    e.trace_id,
+                    e.span_id,
+                    e.parent_span_id,
+                    e.service_name,
+                    e.node_id,
+                    e.span_name,
+                    e.span_kind,
+                    e.start_time_unix_nano,
+                    e.end_time_unix_nano,
+                    e.duration_ns as i64,
+                    e.status_code,
+                    e.status_message,
+                    e.attributes_json,
+                ])?;
+                count = count.saturating_add(1);
+            }
+            drop(stmt);
+            conn.execute_batch("COMMIT;")?;
+            count
+        };
+        self.record_write_and_maybe_flush();
         Ok(count)
     }
 
@@ -357,46 +616,47 @@ impl HotDuckDbStore {
         if entries.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO otel_metrics (
-                timestamp_unix_nano, service_name, node_id, metric_name, metric_unit,
-                value_f64, arch, cpu_cluster, vlen_bits, memlock_used_bytes,
-                memlock_limit_bytes, trace_id, span_id, attributes_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-            "#,
-        )?;
+        let count = {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut stmt = conn.prepare(
+                r#"
+                INSERT INTO otel_metrics (
+                    timestamp_unix_nano, service_name, node_id, metric_name, metric_unit,
+                    value_f64, arch, cpu_cluster, vlen_bits, memlock_used_bytes,
+                    memlock_limit_bytes, trace_id, span_id, attributes_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                "#,
+            )?;
 
-        let mut count = 0u32;
-        for e in entries {
-            let vlen_i32 = e.vlen_bits.map(|v| v as i32);
-            let mem_used_i64 = e.memlock_used_bytes.map(|v| v as i64);
-            let mem_limit_i64 = e.memlock_limit_bytes.map(|v| v as i64);
-            stmt.execute(params![
-                e.timestamp_unix_nano,
-                e.service_name,
-                e.node_id,
-                e.metric_name,
-                e.metric_unit,
-                e.value_f64,
-                e.arch,
-                e.cpu_cluster,
-                vlen_i32,
-                mem_used_i64,
-                mem_limit_i64,
-                e.trace_id,
-                e.span_id,
-                e.attributes_json,
-            ])?;
-            count = count.saturating_add(1);
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
-        }
+            let mut count = 0u32;
+            for e in entries {
+                let vlen_i32 = e.vlen_bits.map(|v| v as i32);
+                let mem_used_i64 = e.memlock_used_bytes.map(|v| v as i64);
+                let mem_limit_i64 = e.memlock_limit_bytes.map(|v| v as i64);
+                stmt.execute(params![
+                    e.timestamp_unix_nano,
+                    e.service_name,
+                    e.node_id,
+                    e.metric_name,
+                    e.metric_unit,
+                    e.value_f64,
+                    e.arch,
+                    e.cpu_cluster,
+                    vlen_i32,
+                    mem_used_i64,
+                    mem_limit_i64,
+                    e.trace_id,
+                    e.span_id,
+                    e.attributes_json,
+                ])?;
+                count = count.saturating_add(1);
+            }
+            drop(stmt);
+            conn.execute_batch("COMMIT;")?;
+            count
+        };
+        self.record_write_and_maybe_flush();
         Ok(count)
     }
 
@@ -414,42 +674,43 @@ impl HotDuckDbStore {
         if entries.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO test_case_runs (
-                job_id, repo_key, branch_key, commit_sha, crate_name,
-                test_binary, test_name, status, duration_ms, failure_summary,
-                timestamp_unix_nano, node_id, arch
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-        )?;
+        let count = {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut stmt = conn.prepare(
+                r#"
+                INSERT INTO test_case_runs (
+                    job_id, repo_key, branch_key, commit_sha, crate_name,
+                    test_binary, test_name, status, duration_ms, failure_summary,
+                    timestamp_unix_nano, node_id, arch
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )?;
 
-        let mut count = 0u32;
-        for e in entries {
-            stmt.execute(params![
-                e.job_id,
-                e.repo_key,
-                e.branch_key,
-                e.commit_sha,
-                e.crate_name,
-                e.test_binary,
-                e.test_name,
-                e.status,
-                e.duration_ms,
-                e.failure_summary,
-                e.timestamp_unix_nano,
-                e.node_id,
-                e.arch,
-            ])?;
-            count = count.saturating_add(1);
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
-        }
+            let mut count = 0u32;
+            for e in entries {
+                stmt.execute(params![
+                    e.job_id,
+                    e.repo_key,
+                    e.branch_key,
+                    e.commit_sha,
+                    e.crate_name,
+                    e.test_binary,
+                    e.test_name,
+                    e.status,
+                    e.duration_ms,
+                    e.failure_summary,
+                    e.timestamp_unix_nano,
+                    e.node_id,
+                    e.arch,
+                ])?;
+                count = count.saturating_add(1);
+            }
+            drop(stmt);
+            conn.execute_batch("COMMIT;")?;
+            count
+        };
+        self.record_write_and_maybe_flush();
         Ok(count)
     }
 
@@ -467,49 +728,50 @@ impl HotDuckDbStore {
         if entries.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO benchmark_runs (
-                job_id, repo_key, branch_key, commit_sha, crate_name,
-                bench_name, ns_per_iter, std_dev_ns, mad_ns, p50_ns,
-                p95_ns, p99_ns, throughput_value, throughput_unit, arch,
-                cpu_cluster, vlen_bits, timestamp_unix_nano, node_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-            "#,
-        )?;
+        let count = {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut stmt = conn.prepare(
+                r#"
+                INSERT INTO benchmark_runs (
+                    job_id, repo_key, branch_key, commit_sha, crate_name,
+                    bench_name, ns_per_iter, std_dev_ns, mad_ns, p50_ns,
+                    p95_ns, p99_ns, throughput_value, throughput_unit, arch,
+                    cpu_cluster, vlen_bits, timestamp_unix_nano, node_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                "#,
+            )?;
 
-        let mut count = 0u32;
-        for e in entries {
-            stmt.execute(params![
-                e.job_id,
-                e.repo_key,
-                e.branch_key,
-                e.commit_sha,
-                e.crate_name,
-                e.bench_name,
-                e.ns_per_iter,
-                e.std_dev_ns,
-                e.mad_ns,
-                e.p50_ns,
-                e.p95_ns,
-                e.p99_ns,
-                e.throughput_value,
-                e.throughput_unit,
-                e.arch,
-                e.cpu_cluster,
-                e.vlen_bits as i32,
-                e.timestamp_unix_nano,
-                e.node_id,
-            ])?;
-            count = count.saturating_add(1);
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
-        }
+            let mut count = 0u32;
+            for e in entries {
+                stmt.execute(params![
+                    e.job_id,
+                    e.repo_key,
+                    e.branch_key,
+                    e.commit_sha,
+                    e.crate_name,
+                    e.bench_name,
+                    e.ns_per_iter,
+                    e.std_dev_ns,
+                    e.mad_ns,
+                    e.p50_ns,
+                    e.p95_ns,
+                    e.p99_ns,
+                    e.throughput_value,
+                    e.throughput_unit,
+                    e.arch,
+                    e.cpu_cluster,
+                    e.vlen_bits as i32,
+                    e.timestamp_unix_nano,
+                    e.node_id,
+                ])?;
+                count = count.saturating_add(1);
+            }
+            drop(stmt);
+            conn.execute_batch("COMMIT;")?;
+            count
+        };
+        self.record_write_and_maybe_flush();
         Ok(count)
     }
 
@@ -520,123 +782,163 @@ impl HotDuckDbStore {
     }
 
     /// Upserts a batch of centralized `ActionRunner-controller` job records, branch snapshots,
-    /// and submodule snapshots atomically inside a transaction.
+    /// and submodule snapshots atomically.
+    ///
+    /// - `__ar_ha_lease__` rows are updated in the in-memory `WriteBehindCache` in `O(1)` without
+    ///   touching DuckDB or triggering disk checkpoints.
+    /// - `__ar_job_logs__` rows are buffered in the in-memory `WriteBehindCache` and flushed to
+    ///   the dedicated `job_logs_store` table on the delayed flush interval.
     pub fn upsert_ci_state_batch(
         &self,
         records: &[CentralJobRecord],
         branch_snapshots: &[CentralBranchSnapshot],
         submodule_snapshots: &[CentralSubmoduleSnapshot],
     ) -> Result<u32, MuObserveError> {
-        let conn = self.lock_conn()?;
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-
         let mut total = 0u32;
-
-        if !records.is_empty() {
-            let mut stmt = conn.prepare(
-                r#"
-                INSERT OR REPLACE INTO jobs_history (
-                    job_id, event_type, repo_name, repo_key, clone_url,
-                    commit_sha, ref_name, branch_key, sender, queued_at_us,
-                    updated_at_us, status_state, exit_code, duration_secs, quality_score,
-                    letter_grade, coverage_pct, benchmark_summary, tests_passed, tests_total,
-                    advisories_count, clippy_warnings, record_json
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5,
-                    ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15,
-                    ?16, ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23
-                )
-                "#,
-            )?;
-            for r in records {
-                stmt.execute(params![
-                    r.job_id,
-                    r.event_type,
-                    r.repo_name,
-                    r.repo_key,
-                    r.clone_url,
-                    r.commit_sha,
-                    r.ref_name,
-                    r.branch_key,
-                    r.sender,
-                    r.queued_at_us,
-                    r.updated_at_us,
-                    r.status_state,
-                    r.exit_code,
-                    r.duration_secs,
-                    r.quality_score,
-                    r.letter_grade,
-                    r.coverage_pct,
-                    r.benchmark_summary,
-                    r.tests_passed,
-                    r.tests_total,
-                    r.advisories_count,
-                    r.clippy_warnings,
-                    r.record_json,
-                ])?;
-                total = total.saturating_add(1);
-            }
-        }
-
-        if !branch_snapshots.is_empty() {
-            let mut stmt = conn.prepare(
-                r#"
-                INSERT OR REPLACE INTO branch_snapshots (
-                    repo_key, branch_key, repo_name, ref_name,
-                    latest_active_job_id, latest_active_json, latest_active_queued_us,
-                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                "#,
-            )?;
-            for b in branch_snapshots {
-                stmt.execute(params![
-                    b.repo_key,
-                    b.branch_key,
-                    b.repo_name,
-                    b.ref_name,
-                    b.latest_active_job_id,
-                    b.latest_active_json,
-                    b.latest_active_queued_us,
-                    b.latest_completed_job_id,
-                    b.latest_completed_json,
-                    b.latest_completed_queued_us,
-                ])?;
-                total = total.saturating_add(1);
-            }
-        }
+        let mut regular_sub_snapshots: Vec<&CentralSubmoduleSnapshot> = Vec::new();
+        let mut had_cached_log_update = false;
 
         if !submodule_snapshots.is_empty() {
-            let mut stmt = conn.prepare(
-                r#"
-                INSERT OR REPLACE INTO submodule_snapshots (
-                    parent_repo_key, branch_key, submodule_key, submodule_path_key,
-                    latest_active_job_id, latest_active_json, latest_active_queued_us,
-                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                "#,
-            )?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| MuObserveError::LockPoisoned("WriteBehindCache mutex".into()))?;
             for s in submodule_snapshots {
-                stmt.execute(params![
-                    s.parent_repo_key,
-                    s.branch_key,
-                    s.submodule_key,
-                    s.submodule_path_key,
-                    s.latest_active_job_id,
-                    s.latest_active_json,
-                    s.latest_active_queued_us,
-                    s.latest_completed_job_id,
-                    s.latest_completed_json,
-                    s.latest_completed_queued_us,
-                ])?;
-                total = total.saturating_add(1);
+                if s.parent_repo_key == INTERNAL_LEASE_REPO_KEY {
+                    cache
+                        .lease_snapshots
+                        .insert((s.branch_key.clone(), s.submodule_key.clone()), s.clone());
+                    total = total.saturating_add(1);
+                } else if s.parent_repo_key == INTERNAL_LOG_REPO_KEY {
+                    let key = (s.branch_key.clone(), s.submodule_key.clone());
+                    cache.job_logs.insert(key.clone(), s.clone());
+                    cache.dirty_job_logs.insert(key);
+                    had_cached_log_update = true;
+                    total = total.saturating_add(1);
+                } else {
+                    regular_sub_snapshots.push(s);
+                }
+            }
+            if had_cached_log_update {
+                cache.prune_job_logs_to_limit(MAX_PERSISTED_JOB_LOGS);
             }
         }
 
-        conn.execute_batch("COMMIT;")?;
-        if self.db_path.is_some() {
-            let _ = conn.execute_batch("CHECKPOINT;");
+        let has_db_writes = !records.is_empty()
+            || !branch_snapshots.is_empty()
+            || !regular_sub_snapshots.is_empty();
+
+        if has_db_writes {
+            let conn = self.lock_conn()?;
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+
+            if !records.is_empty() {
+                let mut stmt = conn.prepare(
+                    r#"
+                    INSERT OR REPLACE INTO jobs_history (
+                        job_id, event_type, repo_name, repo_key, clone_url,
+                        commit_sha, ref_name, branch_key, sender, queued_at_us,
+                        updated_at_us, status_state, exit_code, duration_secs, quality_score,
+                        letter_grade, coverage_pct, benchmark_summary, tests_passed, tests_total,
+                        advisories_count, clippy_warnings, record_json
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5,
+                        ?6, ?7, ?8, ?9, ?10,
+                        ?11, ?12, ?13, ?14, ?15,
+                        ?16, ?17, ?18, ?19, ?20,
+                        ?21, ?22, ?23
+                    )
+                    "#,
+                )?;
+                for r in records {
+                    stmt.execute(params![
+                        r.job_id,
+                        r.event_type,
+                        r.repo_name,
+                        r.repo_key,
+                        r.clone_url,
+                        r.commit_sha,
+                        r.ref_name,
+                        r.branch_key,
+                        r.sender,
+                        r.queued_at_us,
+                        r.updated_at_us,
+                        r.status_state,
+                        r.exit_code,
+                        r.duration_secs,
+                        r.quality_score,
+                        r.letter_grade,
+                        r.coverage_pct,
+                        r.benchmark_summary,
+                        r.tests_passed,
+                        r.tests_total,
+                        r.advisories_count,
+                        r.clippy_warnings,
+                        r.record_json,
+                    ])?;
+                    total = total.saturating_add(1);
+                }
+            }
+
+            if !branch_snapshots.is_empty() {
+                let mut stmt = conn.prepare(
+                    r#"
+                    INSERT OR REPLACE INTO branch_snapshots (
+                        repo_key, branch_key, repo_name, ref_name,
+                        latest_active_job_id, latest_active_json, latest_active_queued_us,
+                        latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "#,
+                )?;
+                for b in branch_snapshots {
+                    stmt.execute(params![
+                        b.repo_key,
+                        b.branch_key,
+                        b.repo_name,
+                        b.ref_name,
+                        b.latest_active_job_id,
+                        b.latest_active_json,
+                        b.latest_active_queued_us,
+                        b.latest_completed_job_id,
+                        b.latest_completed_json,
+                        b.latest_completed_queued_us,
+                    ])?;
+                    total = total.saturating_add(1);
+                }
+            }
+
+            if !regular_sub_snapshots.is_empty() {
+                let mut stmt = conn.prepare(
+                    r#"
+                    INSERT OR REPLACE INTO submodule_snapshots (
+                        parent_repo_key, branch_key, submodule_key, submodule_path_key,
+                        latest_active_job_id, latest_active_json, latest_active_queued_us,
+                        latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "#,
+                )?;
+                for s in regular_sub_snapshots {
+                    stmt.execute(params![
+                        s.parent_repo_key,
+                        s.branch_key,
+                        s.submodule_key,
+                        s.submodule_path_key,
+                        s.latest_active_job_id,
+                        s.latest_active_json,
+                        s.latest_active_queued_us,
+                        s.latest_completed_job_id,
+                        s.latest_completed_json,
+                        s.latest_completed_queued_us,
+                    ])?;
+                    total = total.saturating_add(1);
+                }
+            }
+
+            conn.execute_batch("COMMIT;")?;
+        }
+
+        if has_db_writes || had_cached_log_update {
+            self.record_write_and_maybe_flush();
         }
         Ok(total)
     }
@@ -749,10 +1051,103 @@ impl HotDuckDbStore {
     }
 
     /// Queries centralized `submodule_snapshots` with parameterized filters.
+    ///
+    /// - Queries targeting `__ar_ha_lease__` are served directly from the in-memory `WriteBehindCache`.
+    /// - Queries targeting `__ar_job_logs__` merge the in-memory `WriteBehindCache` with `job_logs_store`.
     pub fn query_submodule_snapshots(
         &self,
         req: &QuerySubmoduleSnapshotsRequest,
     ) -> Result<Vec<CentralSubmoduleSnapshot>, MuObserveError> {
+        if req.parent_repo_key.as_deref() == Some(INTERNAL_LEASE_REPO_KEY) {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| MuObserveError::LockPoisoned("WriteBehindCache mutex".into()))?;
+            let out: Vec<CentralSubmoduleSnapshot> = cache
+                .lease_snapshots
+                .values()
+                .filter(|s| {
+                    req.submodule_key
+                        .as_deref()
+                        .map(|sk| s.submodule_key == sk)
+                        .unwrap_or(true)
+                        && req
+                            .branch_key
+                            .as_deref()
+                            .map(|bk| s.branch_key == bk)
+                            .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            return Ok(out);
+        }
+
+        if req.parent_repo_key.as_deref() == Some(INTERNAL_LOG_REPO_KEY) {
+            let mut merged: BTreeMap<(String, String), CentralSubmoduleSnapshot> = {
+                let cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| MuObserveError::LockPoisoned("WriteBehindCache mutex".into()))?;
+                cache
+                    .job_logs
+                    .iter()
+                    .filter(|((bk, sk), _)| {
+                        req.submodule_key
+                            .as_deref()
+                            .map(|q_sk| sk == q_sk)
+                            .unwrap_or(true)
+                            && req
+                                .branch_key
+                                .as_deref()
+                                .map(|q_bk| bk == q_bk)
+                                .unwrap_or(true)
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+
+            // If a specific (branch_key, submodule_key) was requested and already hit in memory,
+            // return immediately without acquiring the DuckDB mutex.
+            if req.submodule_key.is_some() && !merged.is_empty() {
+                return Ok(merged.into_values().collect());
+            }
+
+            let conn = self.lock_conn()?;
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    branch_key, submodule_key, submodule_path_key,
+                    latest_active_job_id, latest_active_json, latest_active_queued_us,
+                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+                FROM job_logs_store
+                WHERE (?1 IS NULL OR submodule_key = ?1)
+                  AND (?2 IS NULL OR branch_key = ?2)
+                ORDER BY branch_key ASC, submodule_key ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![req.submodule_key, req.branch_key], |row| {
+                Ok(CentralSubmoduleSnapshot {
+                    parent_repo_key: INTERNAL_LOG_REPO_KEY.to_string(),
+                    branch_key: row.get(0)?,
+                    submodule_key: row.get(1)?,
+                    submodule_path_key: row.get(2)?,
+                    latest_active_job_id: row.get(3)?,
+                    latest_active_json: row.get(4)?,
+                    latest_active_queued_us: row.get(5)?,
+                    latest_completed_job_id: row.get(6)?,
+                    latest_completed_json: row.get(7)?,
+                    latest_completed_queued_us: row.get(8)?,
+                })
+            })?;
+            for r in rows {
+                let snap = r?;
+                merged
+                    .entry((snap.branch_key.clone(), snap.submodule_key.clone()))
+                    .or_insert(snap);
+            }
+            return Ok(merged.into_values().collect());
+        }
+
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r#"
@@ -805,6 +1200,7 @@ impl HotDuckDbStore {
             "jobs_history",
             "branch_snapshots",
             "submodule_snapshots",
+            "job_logs_store",
             "v_logs",
             "v_traces",
             "v_metrics",
@@ -1124,5 +1520,32 @@ mod tests {
             .expect("query near_protocol snapshots");
         assert_eq!(near_results.len(), 1);
         assert_eq!(near_results[0].parent_repo_key, "near_protocol");
+
+        // 4. Verify submodule_snapshots table itself never stores __ar_job_logs__ or __ar_ha_lease__,
+        // and flush_delayed persists dirty job logs into job_logs_store.
+        assert_eq!(
+            store.count_rows("submodule_snapshots").unwrap(),
+            legit_repos.len() as u64
+        );
+        assert_eq!(store.count_rows("job_logs_store").unwrap(), 0);
+        let flushed = store.flush_delayed(true).expect("force delayed flush");
+        assert_eq!(flushed, 1);
+        assert_eq!(store.count_rows("job_logs_store").unwrap(), 1);
+
+        // 5. Verify __ar_ha_lease__ query returns the in-memory lease snapshot
+        let lease_req = QuerySubmoduleSnapshotsRequest {
+            request_id: "req-lease".into(),
+            parent_repo_key: Some("__ar_ha_lease__".into()),
+            submodule_key: Some("leader".into()),
+            branch_key: Some("lease".into()),
+        };
+        let lease_results = store
+            .query_submodule_snapshots(&lease_req)
+            .expect("query lease snapshot");
+        assert_eq!(lease_results.len(), 1);
+        assert_eq!(
+            lease_results[0].latest_active_json.as_deref(),
+            Some("{\"leader\":\"node-a\"}")
+        );
     }
 }
