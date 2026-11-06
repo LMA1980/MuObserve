@@ -554,6 +554,19 @@ impl MtlsIngestServer {
 
     /// Binds a TCP listener and serves mTLS connections until the listener task is aborted.
     pub async fn serve(&self, listener: TcpListener) -> Result<(), MuObserveError> {
+        let flush_store = self.store.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                ticker.tick().await;
+                let store_clone = flush_store.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store_clone.flush_delayed(false);
+                })
+                .await;
+            }
+        });
+
         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
         loop {
             let (tcp_stream, peer_addr): (tokio::net::TcpStream, SocketAddr) =
