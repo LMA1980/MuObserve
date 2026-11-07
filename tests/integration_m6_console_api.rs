@@ -5,7 +5,8 @@ use muobserve::{
     build_console_api_router, CompactorConfig, HotDuckDbStore, McpServer, ParquetCompactor,
 };
 use muobserve_ipc::{
-    BenchmarkRunEntry, OtelLogEntry, OtelMetricEntry, OtelSpanEntry, TestCaseRunEntry,
+    BenchmarkRunEntry, CentralSubmoduleSnapshot, OtelLogEntry, OtelMetricEntry, OtelSpanEntry,
+    TestCaseRunEntry,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -370,4 +371,101 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
     assert!(!st_raw.contains('\\'));
     assert!(!st_raw.contains("muobserve.duckdb"));
     assert!(!st_raw.contains("SELECT"));
+}
+
+async fn get_text(router: &axum::Router, uri: &str) -> (StatusCode, String, String) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    (status, cache_control, text)
+}
+
+#[tokio::test]
+async fn test_sanitized_ci_job_logs_in_logs_and_job_log_endpoint() {
+    let store = HotDuckDbStore::open_in_memory().expect("open in-memory HotDuckDbStore");
+    let raw_log = concat!(
+        "=== Stage 'test-check' started on worker 'worker-riscv64' ===\n",
+        "2026-11-07T21:36:55.123456Z [node-b] [test-check] [stdout] Running /var/lib/action-runner/work/tests on 10.0.0.42\n",
+        "2026-11-07T21:36:56.654321Z [node-b] [test-check] [stderr] error: test failed with token ghp_supersecret9876543210\n",
+    );
+
+    store
+        .upsert_ci_state_batch(
+            &[],
+            &[],
+            &[CentralSubmoduleSnapshot {
+                parent_repo_key: "__ar_job_logs__".into(),
+                branch_key: "log".into(),
+                submodule_key: "job-1794087359-65d5b504".into(),
+                submodule_path_key: "log".into(),
+                latest_active_job_id: Some("job-1794087359-65d5b504".into()),
+                latest_active_json: Some(raw_log.into()),
+                latest_active_queued_us: Some(1_794_087_415_000_000),
+                latest_completed_job_id: None,
+                latest_completed_json: None,
+                latest_completed_queued_us: None,
+            }],
+        )
+        .expect("upsert job log snapshot");
+
+    let app = build_console_api_router(store);
+
+    // 1. Verify /api/v1/logs surfaces sanitized CI job log lines with trace_id "tr-ci-65d5b5"
+    let (status, cc, logs_json) =
+        get_json(&app, "/api/v1/logs?job_id=job-1794087359-65d5b504&limit=50").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cc, "no-store");
+    assert_eq!(logs_json["total"], 3);
+    let serialized = serde_json::to_string(&logs_json).unwrap();
+    assert!(serialized.contains("tr-ci-65d5b5"));
+    assert!(serialized.contains("job-1794087359-65d5b504"));
+    assert!(serialized.contains("192.0.2."));
+    assert!(!serialized.contains("10.0.0.42"));
+    assert!(!serialized.contains("/var/lib/action-runner"));
+    assert!(!serialized.contains("ghp_supersecret9876543210"));
+
+    // 2. Verify /api/logs (without /v1 prefix, as proxied by /api/obs/logs) works identically
+    let (alias_status, _, alias_json) =
+        get_json(&app, "/api/logs?severity=error&trace_id=tr-ci-65d5b5").await;
+    assert_eq!(alias_status, StatusCode::OK);
+    assert_eq!(alias_json["total"], 1);
+    assert_eq!(alias_json["logs"][0]["severity_text"], "ERROR");
+    assert_eq!(alias_json["logs"][0]["stage_id"], "test-check");
+
+    // 3. Verify anonymous/public per-job sanitized log endpoint (/api/v1/jobs/{job_id}/log and /api/jobs/{job_id}/log)
+    let (jl_status, jl_cc, jl_text) =
+        get_text(&app, "/api/v1/jobs/job-1794087359-65d5b504/log").await;
+    assert_eq!(jl_status, StatusCode::OK);
+    assert_eq!(jl_cc, "no-store");
+    assert!(jl_text.contains("[test-check]"));
+    assert!(jl_text.contains("192.0.2."));
+    assert!(!jl_text.contains("10.0.0.42"));
+    assert!(!jl_text.contains("/var/lib/action-runner"));
+    assert!(!jl_text.contains("ghp_supersecret9876543210"));
+
+    let (jl_alias_status, _, jl_alias_text) =
+        get_text(&app, "/api/jobs/job-1794087359-65d5b504/log").await;
+    assert_eq!(jl_alias_status, StatusCode::OK);
+    assert_eq!(jl_alias_text, jl_text);
+
+    // 4. Non-existent job returns 404 Not Found
+    let (missing_status, _, _) = get_json(&app, "/api/v1/jobs/job-nonexistent-000000/log").await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
 }

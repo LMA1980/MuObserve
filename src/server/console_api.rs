@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use duckdb::params;
+use muobserve_ipc::{QueryJobsHistoryRequest, QuerySubmoduleSnapshotsRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -143,6 +144,7 @@ struct LogsQueryParams {
     severity: Option<String>,
     service: Option<String>,
     trace_id: Option<String>,
+    job_id: Option<String>,
     limit: Option<usize>,
 }
 
@@ -156,23 +158,27 @@ struct MetricsQueryParams {
 }
 
 /// Builds the read-only observability Axum [`Router`] mounting `/api/v1/*`, `/api/v1/console/*`,
-/// and `/api/observe/*` endpoints with `Cache-Control: no-store`.
+/// `/api/observe/*`, and `/api/*` endpoints with `Cache-Control: no-store`.
 pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
     Router::new()
         // Smartscape topology
         .route("/api/v1/smartscape", get(handle_get_smartscape))
         .route("/api/v1/console/smartscape", get(handle_get_smartscape))
         .route("/api/observe/smartscape", get(handle_get_smartscape))
+        .route("/api/smartscape", get(handle_get_smartscape))
         // Deterministic SLO problems & SSE feed
         .route("/api/v1/problems", get(handle_get_problems))
         .route("/api/v1/console/problems", get(handle_get_problems))
         .route("/api/observe/problems", get(handle_get_problems))
+        .route("/api/problems", get(handle_get_problems))
         .route("/api/v1/events", get(handle_get_problem_events_sse))
         .route("/api/observe/events", get(handle_get_problem_events_sse))
+        .route("/api/events", get(handle_get_problem_events_sse))
         // PurePath traces list & waterfall
         .route("/api/v1/traces", get(handle_get_traces))
         .route("/api/v1/console/traces", get(handle_get_traces))
         .route("/api/observe/traces", get(handle_get_traces))
+        .route("/api/traces", get(handle_get_traces))
         .route("/api/v1/traces/{trace_id}", get(handle_get_trace_purepath))
         .route(
             "/api/v1/traces/{trace_id}/purepath",
@@ -194,10 +200,28 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
             "/api/observe/traces/{trace_id}/purepath",
             get(handle_get_trace_purepath),
         )
-        // Fixed-filter structured logs
+        .route("/api/traces/{trace_id}", get(handle_get_trace_purepath))
+        .route(
+            "/api/traces/{trace_id}/purepath",
+            get(handle_get_trace_purepath),
+        )
+        // Fixed-filter structured logs & CI job log stream
         .route("/api/v1/logs", get(handle_get_logs))
         .route("/api/v1/console/logs", get(handle_get_logs))
         .route("/api/observe/logs", get(handle_get_logs))
+        .route("/api/logs", get(handle_get_logs))
+        // Sanitized per-job CI build log endpoint for anonymous/public access
+        .route("/api/v1/jobs/{job_id}/log", get(handle_get_job_log))
+        .route("/api/v1/jobs/{job_id}/logs", get(handle_get_job_log))
+        .route("/api/v1/console/jobs/{job_id}/log", get(handle_get_job_log))
+        .route(
+            "/api/v1/console/jobs/{job_id}/logs",
+            get(handle_get_job_log),
+        )
+        .route("/api/observe/jobs/{job_id}/log", get(handle_get_job_log))
+        .route("/api/observe/jobs/{job_id}/logs", get(handle_get_job_log))
+        .route("/api/jobs/{job_id}/log", get(handle_get_job_log))
+        .route("/api/jobs/{job_id}/logs", get(handle_get_job_log))
         // Fixed-filter metrics timeseries & cluster efficiency
         .route("/api/v1/metrics/timeseries", get(handle_get_metrics))
         .route("/api/v1/metrics", get(handle_get_metrics))
@@ -207,12 +231,17 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
             get(handle_get_metrics),
         )
         .route("/api/observe/metrics", get(handle_get_metrics))
+        .route("/api/metrics", get(handle_get_metrics))
+        .route("/api/metrics/timeseries", get(handle_get_metrics))
         // Sanitized storage health status
         .route("/api/v1/store/status", get(handle_get_store_status))
         .route("/api/v1/datastore", get(handle_get_store_status))
         .route("/api/v1/console/store/status", get(handle_get_store_status))
         .route("/api/v1/console/datastore", get(handle_get_store_status))
         .route("/api/observe/datastore", get(handle_get_store_status))
+        .route("/api/observe/store/status", get(handle_get_store_status))
+        .route("/api/store/status", get(handle_get_store_status))
+        .route("/api/datastore", get(handle_get_store_status))
         .with_state(store)
 }
 
@@ -425,21 +454,32 @@ async fn handle_get_logs(
             return json_error_response(StatusCode::BAD_REQUEST, msg);
         }
     }
+    if let Some(jid) = &params.job_id {
+        if let Err(msg) = validate_safe_filter_token(jid) {
+            return json_error_response(StatusCode::BAD_REQUEST, msg);
+        }
+    }
 
+    let max_limit = if params.job_id.is_some() { 500 } else { 100 };
     let limit = match params.limit {
-        Some(0) | Some(101..) => {
+        Some(0) => {
+            return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 100")
+        }
+        Some(l) if l > max_limit => {
             return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 100")
         }
         Some(l) => l,
+        None if params.job_id.is_some() => 200,
         None => 50,
     };
 
-    match query_sanitized_logs(
+    match query_sanitized_logs_with_job(
         &store,
         &sev_norm,
         min_sev_range,
         params.service.as_deref(),
         params.trace_id.as_deref(),
+        params.job_id.as_deref(),
         limit,
     ) {
         Ok(resp) => no_store_json(StatusCode::OK, &resp),
@@ -447,7 +487,34 @@ async fn handle_get_logs(
     }
 }
 
-/// Queries `v_logs` using fixed parameterized SQL filters and applies the 3-stage [`PrivacyRedactor`].
+async fn handle_get_job_log(
+    State(store): State<HotDuckDbStore>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    if let Err(msg) = validate_safe_filter_token(&job_id) {
+        return json_error_response(StatusCode::BAD_REQUEST, msg);
+    }
+
+    match query_sanitized_job_log(&store, &job_id) {
+        Ok(Some(body)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Job log for '{job_id}' not found"),
+        ),
+        Err(e) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Queries `v_logs` and `job_logs_store` using fixed parameterized SQL filters and applies
+/// the 3-stage [`PrivacyRedactor`].
 pub fn query_sanitized_logs(
     store: &HotDuckDbStore,
     severity_label: &str,
@@ -456,10 +523,78 @@ pub fn query_sanitized_logs(
     trace_id_filter: Option<&str>,
     limit: usize,
 ) -> Result<LogsQueryResponse, MuObserveError> {
-    let redactor = PrivacyRedactor::new();
-    let conn = store.lock_conn()?;
-    let bounded_limit = limit.clamp(1, 100) as i64;
+    query_sanitized_logs_with_job(
+        store,
+        severity_label,
+        sev_range,
+        service_filter,
+        trace_id_filter,
+        None,
+        limit,
+    )
+}
 
+/// Queries `v_logs` and `job_logs_store` (`__ar_job_logs__`) with optional `job_id_filter`,
+/// applying the 3-stage [`PrivacyRedactor`] to both OTLP collector logs and CI stage logs.
+#[allow(clippy::too_many_arguments)]
+pub fn query_sanitized_logs_with_job(
+    store: &HotDuckDbStore,
+    severity_label: &str,
+    sev_range: Option<(i32, i32, &str)>,
+    service_filter: Option<&str>,
+    trace_id_filter: Option<&str>,
+    job_id_filter: Option<&str>,
+    limit: usize,
+) -> Result<LogsQueryResponse, MuObserveError> {
+    let redactor = PrivacyRedactor::new();
+    let max_cap = if job_id_filter.is_some() { 500 } else { 100 };
+    let bounded_limit = limit.clamp(1, max_cap);
+
+    let mut logs = query_v_logs_rows(
+        store,
+        &redactor,
+        sev_range,
+        service_filter,
+        trace_id_filter,
+        job_id_filter,
+        bounded_limit,
+    )?;
+
+    let ci_logs = extract_sanitized_ci_job_log_items(
+        store,
+        &redactor,
+        sev_range,
+        service_filter,
+        trace_id_filter,
+        job_id_filter,
+        bounded_limit,
+    )?;
+    logs.extend(ci_logs);
+
+    logs.sort_by_key(|a| std::cmp::Reverse(a.timestamp_unix_nano));
+    logs.truncate(bounded_limit);
+
+    Ok(LogsQueryResponse {
+        severity: if severity_label.is_empty() {
+            "all".to_string()
+        } else {
+            severity_label.to_string()
+        },
+        total: logs.len(),
+        logs,
+    })
+}
+
+fn query_v_logs_rows(
+    store: &HotDuckDbStore,
+    redactor: &PrivacyRedactor,
+    sev_range: Option<(i32, i32, &str)>,
+    service_filter: Option<&str>,
+    trace_id_filter: Option<&str>,
+    job_id_filter: Option<&str>,
+    bounded_limit: usize,
+) -> Result<Vec<ConsoleLogItem>, MuObserveError> {
+    let conn = store.lock_conn()?;
     let mut stmt = conn.prepare(
         r#"
         SELECT
@@ -467,12 +602,13 @@ pub fn query_sanitized_logs(
             service_name, node_id, body, attributes_json, job_id, stage_id
         FROM v_logs
         WHERE (?1 IS NULL OR trace_id = ?1)
+          AND (?2 IS NULL OR job_id = ?2)
         ORDER BY timestamp_unix_nano DESC
         LIMIT 500
         "#,
     )?;
 
-    let rows = stmt.query_map(params![trace_id_filter], |r| {
+    let rows = stmt.query_map(params![trace_id_filter, job_id_filter], |r| {
         let ts_ns: i64 = r.get(0)?;
         let raw_svc: String = r.get(5)?;
         let raw_node: String = r.get(6)?;
@@ -499,13 +635,8 @@ pub fn query_sanitized_logs(
     let mut logs = Vec::new();
     for r in rows {
         let item = r?;
-        if let Some((min_n, max_n, txt)) = sev_range {
-            let num_matches = item.severity_number >= min_n && item.severity_number <= max_n;
-            let text_matches = item.severity_text.eq_ignore_ascii_case(txt)
-                || (txt == "ERROR" && item.severity_text.eq_ignore_ascii_case("FATAL"));
-            if !num_matches && !text_matches {
-                continue;
-            }
+        if !matches_severity(&item, sev_range) {
+            continue;
         }
         if let Some(svc) = service_filter {
             if !item.service.eq_ignore_ascii_case(svc) {
@@ -513,20 +644,314 @@ pub fn query_sanitized_logs(
             }
         }
         logs.push(item);
-        if logs.len() >= bounded_limit as usize {
+        if logs.len() >= bounded_limit {
+            break;
+        }
+    }
+    Ok(logs)
+}
+
+fn matches_severity(item: &ConsoleLogItem, sev_range: Option<(i32, i32, &str)>) -> bool {
+    let Some((min_n, max_n, txt)) = sev_range else {
+        return true;
+    };
+    let num_matches = item.severity_number >= min_n && item.severity_number <= max_n;
+    let text_matches = item.severity_text.eq_ignore_ascii_case(txt)
+        || (txt == "ERROR" && item.severity_text.eq_ignore_ascii_case("FATAL"));
+    num_matches || text_matches
+}
+
+fn derive_ci_short_job_and_trace(job_id: &str) -> (String, String) {
+    let suffix = job_id.rsplit('-').next().unwrap_or(job_id);
+    let short_job: String = if suffix.len() >= 6 {
+        suffix.chars().take(6).collect()
+    } else if !job_id.is_empty() {
+        job_id.chars().take(6).collect()
+    } else {
+        "live".to_string()
+    };
+    let trace_id = format!("tr-ci-{short_job}");
+    (short_job, trace_id)
+}
+
+struct ParsedCiLogLine {
+    timestamp_ns: Option<i64>,
+    node_id: String,
+    stage_id: Option<String>,
+    is_stderr: bool,
+    body: String,
+}
+
+fn parse_ci_job_log_line(line: &str) -> ParsedCiLogLine {
+    let trimmed = line.trim();
+    // Worker log format from ActionRunner-controller:
+    // "<RFC3339> [<node_id>] [<stage_id>] [stdout|stderr] <content>"
+    if let Some((first_tok, rest1)) = trimmed.split_once(" [") {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(first_tok.trim()) {
+            let ts_ns = dt
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| dt.timestamp_micros().saturating_mul(1_000));
+            if let Some((node_tok, rest2)) = rest1.split_once("] [") {
+                if let Some((stage_tok, rest3)) = rest2.split_once("] ") {
+                    let (is_stderr, content) = if let Some(c) = rest3.strip_prefix("[stderr] ") {
+                        (true, c)
+                    } else if let Some(c) = rest3.strip_prefix("[stdout] ") {
+                        (false, c)
+                    } else {
+                        (false, rest3)
+                    };
+                    return ParsedCiLogLine {
+                        timestamp_ns: Some(ts_ns),
+                        node_id: node_tok.trim().to_string(),
+                        stage_id: Some(stage_tok.trim().to_string()),
+                        is_stderr,
+                        body: format!("[{}] {}", stage_tok.trim(), content.trim()),
+                    };
+                }
+            }
+        }
+    }
+
+    // Controller stage lifecycle lines:
+    // "=== Stage '<stage_id>' started on worker '<node_id>' ==="
+    if let Some(after_stage) = trimmed.strip_prefix("=== Stage '") {
+        if let Some((stage_tok, after_quote)) = after_stage.split_once('\'') {
+            let node_id = after_quote
+                .split_once("worker '")
+                .and_then(|(_, w)| w.split_once('\''))
+                .map(|(n, _)| n.to_string())
+                .unwrap_or_else(|| "controller".to_string());
+            return ParsedCiLogLine {
+                timestamp_ns: None,
+                node_id,
+                stage_id: Some(stage_tok.to_string()),
+                is_stderr: false,
+                body: trimmed.to_string(),
+            };
+        }
+    }
+
+    ParsedCiLogLine {
+        timestamp_ns: None,
+        node_id: "controller".to_string(),
+        stage_id: None,
+        is_stderr: false,
+        body: trimmed.to_string(),
+    }
+}
+
+fn classify_ci_log_severity(line: &str, is_stderr: bool) -> (i32, &'static str) {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("error:")
+        || lower.contains("error[")
+        || lower.contains("panicked at")
+        || lower.contains("exited with status code")
+        || lower.contains("test result: failed")
+        || lower.contains("exit_code=some(1")
+        || (is_stderr && (lower.contains("failed") || lower.contains("fatal")))
+    {
+        (17, "ERROR")
+    } else if lower.contains("warning:") || lower.contains("[warn]") {
+        (13, "WARN")
+    } else {
+        (9, "INFO")
+    }
+}
+
+fn extract_sanitized_ci_job_log_items(
+    store: &HotDuckDbStore,
+    redactor: &PrivacyRedactor,
+    sev_range: Option<(i32, i32, &str)>,
+    service_filter: Option<&str>,
+    trace_id_filter: Option<&str>,
+    job_id_filter: Option<&str>,
+    bounded_limit: usize,
+) -> Result<Vec<ConsoleLogItem>, MuObserveError> {
+    if let Some(svc) = service_filter {
+        if !svc.eq_ignore_ascii_case("actionrunner-rs")
+            && !svc.eq_ignore_ascii_case("action-runner")
+            && !svc.eq_ignore_ascii_case("action-runner-controller")
+        {
+            return Ok(Vec::new());
+        }
+    }
+
+    let mut snapshots = store.query_submodule_snapshots(&QuerySubmoduleSnapshotsRequest {
+        request_id: "console-api-logs".to_string(),
+        parent_repo_key: Some("__ar_job_logs__".to_string()),
+        submodule_key: job_id_filter.map(|j| j.to_ascii_lowercase()),
+        branch_key: Some("log".to_string()),
+    })?;
+
+    snapshots.sort_by_key(|s| {
+        std::cmp::Reverse(
+            s.latest_active_queued_us
+                .or(s.latest_completed_queued_us)
+                .unwrap_or(0),
+        )
+    });
+
+    let per_job_cap = if job_id_filter.is_some() || trace_id_filter.is_some() {
+        bounded_limit
+    } else {
+        15
+    };
+
+    let mut out = Vec::new();
+    for snap in snapshots {
+        let canonical_job_id = snap
+            .latest_active_job_id
+            .as_deref()
+            .or(snap.latest_completed_job_id.as_deref())
+            .unwrap_or(&snap.submodule_key)
+            .to_string();
+        let (short_job, ci_trace_id) = derive_ci_short_job_and_trace(&canonical_job_id);
+
+        if let Some(tf) = trace_id_filter {
+            if !tf.eq_ignore_ascii_case(&ci_trace_id) && !tf.eq_ignore_ascii_case(&canonical_job_id)
+            {
+                continue;
+            }
+        }
+        if let Some(jf) = job_id_filter {
+            if !jf.eq_ignore_ascii_case(&canonical_job_id)
+                && !jf.eq_ignore_ascii_case(&snap.submodule_key)
+            {
+                continue;
+            }
+        }
+
+        let Some(raw_log) = snap
+            .latest_active_json
+            .as_deref()
+            .or(snap.latest_completed_json.as_deref())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+
+        let base_queued_us = snap
+            .latest_active_queued_us
+            .or(snap.latest_completed_queued_us)
+            .unwrap_or(1_700_000_000_000_000);
+        let base_ts_ns = base_queued_us.saturating_mul(1_000);
+
+        let mut job_items = Vec::new();
+        for (idx, raw_line) in raw_log.lines().enumerate() {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            let parsed = parse_ci_job_log_line(raw_line);
+            let (sev_num, sev_txt) = classify_ci_log_severity(&parsed.body, parsed.is_stderr);
+            let ts_ns = parsed.timestamp_ns.unwrap_or_else(|| {
+                base_ts_ns.saturating_add((idx as i64).saturating_mul(1_000_000))
+            });
+            let span_id = match &parsed.stage_id {
+                Some(st) => format!("sp-{short_job}-{}", redactor.redact_str(st)),
+                None => format!("sp-{short_job}-1"),
+            };
+            let item = ConsoleLogItem {
+                timestamp_unix_nano: ts_ns,
+                timestamp_ms: ts_ns / 1_000_000,
+                trace_id: ci_trace_id.clone(),
+                span_id,
+                severity_number: sev_num,
+                severity_text: sev_txt.to_string(),
+                service: "actionrunner-rs".to_string(),
+                service_name: "actionrunner-rs".to_string(),
+                node_id: redactor.redact_host(&parsed.node_id),
+                body: redactor.redact_str(&parsed.body),
+                attributes: json!({
+                    "job_id": canonical_job_id,
+                    "stage_id": parsed.stage_id,
+                }),
+                job_id: Some(canonical_job_id.clone()),
+                stage_id: parsed.stage_id,
+            };
+            if matches_severity(&item, sev_range) {
+                job_items.push(item);
+            }
+        }
+
+        if job_items.len() > per_job_cap {
+            // Preserve high-signal ERROR/WARN/stage header lines + tail of the job log
+            let mut selected = Vec::with_capacity(per_job_cap);
+            let tail_start = job_items.len().saturating_sub(per_job_cap);
+            for (i, it) in job_items.into_iter().enumerate() {
+                if i >= tail_start || it.severity_number >= 13 || it.body.starts_with("=== Stage") {
+                    selected.push(it);
+                }
+            }
+            if selected.len() > per_job_cap {
+                let drop_count = selected.len() - per_job_cap;
+                selected.drain(0..drop_count);
+            }
+            out.extend(selected);
+        } else {
+            out.extend(job_items);
+        }
+
+        if out.len() >= bounded_limit.saturating_mul(2) {
             break;
         }
     }
 
-    Ok(LogsQueryResponse {
-        severity: if severity_label.is_empty() {
-            "all".to_string()
-        } else {
-            severity_label.to_string()
-        },
-        total: logs.len(),
-        logs,
-    })
+    Ok(out)
+}
+
+/// Retrieves and 3-stage sanitizes the full execution log for `job_id` from `job_logs_store`
+/// (merged with `WriteBehindCache.job_logs`), falling back to a sanitized status summary from
+/// `jobs_history` if no log chunks have been written yet.
+pub fn query_sanitized_job_log(
+    store: &HotDuckDbStore,
+    job_id: &str,
+) -> Result<Option<String>, MuObserveError> {
+    let redactor = PrivacyRedactor::new();
+    let key = job_id.trim().to_ascii_lowercase();
+    let snapshots = store.query_submodule_snapshots(&QuerySubmoduleSnapshotsRequest {
+        request_id: "console-api-job-log".to_string(),
+        parent_repo_key: Some("__ar_job_logs__".to_string()),
+        submodule_key: Some(key),
+        branch_key: Some("log".to_string()),
+    })?;
+
+    if let Some(snap) = snapshots.first() {
+        if let Some(raw_log) = snap
+            .latest_active_json
+            .as_deref()
+            .or(snap.latest_completed_json.as_deref())
+            .filter(|s| !s.trim().is_empty())
+        {
+            let mut sanitized = String::with_capacity(raw_log.len());
+            for line in raw_log.lines() {
+                sanitized.push_str(&redactor.redact_str(line));
+                sanitized.push('\n');
+            }
+            return Ok(Some(sanitized));
+        }
+    }
+
+    let jobs = store.query_jobs_history(&QueryJobsHistoryRequest {
+        request_id: "console-api-job-history".to_string(),
+        job_id: Some(job_id.trim().to_string()),
+        repo_key: None,
+        branch_key: None,
+        limit: 1,
+    })?;
+
+    if let Some(rec) = jobs.first() {
+        let summary = format!(
+            "[MuObserve] Job '{}' ({}) on branch '{}' @ {} — status: {}\n",
+            redactor.redact_str(&rec.job_id),
+            redactor.redact_str(&rec.repo_key),
+            redactor.redact_str(&rec.branch_key),
+            redactor.redact_str(&rec.commit_sha),
+            redactor.redact_str(&rec.status_state),
+        );
+        return Ok(Some(summary));
+    }
+
+    Ok(None)
 }
 
 async fn handle_get_metrics(
