@@ -1,4 +1,4 @@
-//! `muobserve`: Distributed OTEL + DuckDB/Parquet observability backend, centralized
+//! `mu-observable-hub`: Distributed OTEL + DuckDB/Parquet observability backend, centralized
 //! `ActionRunner-controller` state catalog, hardware-aware benchmark & test regression
 //! analytics engine, and Antigravity Model Context Protocol (MCP) server.
 

@@ -1,31 +1,31 @@
 [package]
-name = "muobserve"
+name = "mu-observable-hub"
 version = "0.1.0"
 edition = "2021"
 description = "Distributed OTEL + DuckDB/Parquet observability backend, centralized CI state store, hardware-aware benchmark/test regression engine, and Antigravity MCP server"
 license = "AGPL-3.0-only"
-repository = "https://github.com/LMA1980/MuObserve"
-default-run = "muobserve"
+repository = "https://github.com/LMA1980/mu-observable-hub"
+default-run = "mu-observable-hub"
 
 [features]
 default = []
 bundled-duckdb = ["duckdb/bundled"]
 
 [[bin]]
-name = "muobserve"
+name = "mu-observable-hub"
 path = "src/main.rs"
 
 [[bin]]
-name = "muobserve-mcp"
+name = "mu-observable-mcp"
 path = "src/bin/muobserve_mcp.rs"
 
 [[bin]]
-name = "muobserve-cli"
+name = "mu-observable-cli"
 path = "src/bin/muobserve_cli.rs"
 
 [dependencies]
-muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git", branch = "main" }
-mu-isolation = { git = "https://github.com/LMA1980/MuIsolation.git", branch = "main" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
+mu-ci-isolation = { git = "https://github.com/LMA1980/mu-ci-isolation.git", branch = "feat/m8-naming-alignment" }
 duckdb = { version = "=1.2.2", default-features = false }
 arrow = { version = "54", default-features = false, features = ["ipc"] }
 fory = "1.7"

@@ -781,7 +781,7 @@ fn compute_mad_z_score(samples: &mut [f64], candidate: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{OtelLogEntry, OtelMetricEntry, OtelSpanEntry};
+    use mu_observable_ipc::{OtelLogEntry, OtelMetricEntry, OtelSpanEntry};
 
     #[test]
     #[cfg_attr(miri, ignore)]

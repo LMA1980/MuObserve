@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use duckdb::params;
-use muobserve_ipc::{QueryJobsHistoryRequest, QuerySubmoduleSnapshotsRequest};
+use mu_observable_ipc::{QueryJobsHistoryRequest, QuerySubmoduleSnapshotsRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

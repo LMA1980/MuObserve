@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use duckdb::params;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     BenchmarkRegressionItem, RegressionGateReport, RegressionGateRequest, RegressionVerdict,
     TestRegressionItem,
 };
@@ -394,7 +394,7 @@ fn compute_mad(values: &[f64], median: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{BenchmarkRunEntry, TestCaseRunEntry};
+    use mu_observable_ipc::{BenchmarkRunEntry, TestCaseRunEntry};
 
     #[test]
     #[cfg_attr(miri, ignore)]

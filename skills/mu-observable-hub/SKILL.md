@@ -1,15 +1,15 @@
 ---
-name: muobserve-analytics
-description: "Query and analyze distributed OpenTelemetry logs, W3C trace waterfalls, hardware-stratified SpacemiT K3 (X100 vs A100) benchmark regressions, 30-day test flakiness, canary deployment SLOs, and guarded DuckDB/Parquet SQL analytics via MuObserve MCP and muobserve-cli."
+name: mu-observable-hub
+description: "Query and analyze distributed OpenTelemetry logs, W3C trace waterfalls, hardware-stratified SpacemiT K3 (X100 vs A100) benchmark regressions, 30-day test flakiness, canary deployment SLOs, and guarded DuckDB/Parquet SQL analytics via mu-observable-mcp and mu-observable-cli."
 ---
 
-# `muobserve` Observability, Regression Analytics & MCP Usage
+# `mu-observable-hub` Observability, Regression Analytics & MCP Usage
 
-Use this skill when investigating CI pipeline failures, W3C distributed traces, hardware-stratified benchmark regressions across SpacemiT K3 Cluster 0 (`X100`, `VLEN=256`) and Cluster 1 (`A100`, `VLEN=1024`) vs `x86_64`, evaluating canary deployment SLOs, or running read-only analytical SQL queries against `MuObserve`.
+Use this skill when investigating CI pipeline failures, W3C distributed traces, hardware-stratified benchmark regressions across SpacemiT K3 Cluster 0 (`X100`, `VLEN=256`) and Cluster 1 (`A100`, `VLEN=1024`) vs `x86_64`, evaluating canary deployment SLOs, or running read-only analytical SQL queries against `mu-observable-hub`.
 
-## 1. MCP Server Tools (`muobserve-mcp`)
+## 1. MCP Server Tools (`mu-observable-mcp`)
 
-`muobserve-mcp` exposes 10 structured JSON-RPC 2.0 MCP tools over `stdio` or HTTP:
+`mu-observable-mcp` exposes 10 structured JSON-RPC 2.0 MCP tools over `stdio` or HTTP:
 
 | MCP Tool Name | Required Arguments | Purpose |
 | :--- | :--- | :--- |
@@ -24,22 +24,22 @@ Use this skill when investigating CI pipeline failures, W3C distributed traces, 
 | `compare_cluster_efficiency` | *(optional)* `repo_key`, `bench_name` | Compares SpacemiT K3 Cluster 0 (`X100`, `VLEN=256`) vs Cluster 1 (`A100`, `VLEN=1024`) vs `x86_64` execution efficiency. |
 | `execute_analytics_sql` | `sql` | Executes a guarded read-only DuckDB query (`SELECT`/`WITH`/`EXPLAIN` only; DDL/DML/ATTACH/COPY rejected; 5s timeout; 1,000-row cap). |
 
-## 2. CLI Subcommand (`cargo agents muobserve` / `muobserve-cli`)
+## 2. CLI Subcommand (`cargo agents mu-observable-hub` / `mu-observable-cli`)
 
 ```bash
 # Check hardware-stratified benchmark & test regressions for a candidate commit
-muobserve-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   regressions --repo lma1980/k3-core --commit HEAD --baseline main
 
 # Evaluate canary service SLO over a 300s bake window
-muobserve-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   slo --service action-runner-controller --digest HEAD --window-secs 300 --max-errors 0 --max-p99-ms 250.0
 
 # Inspect a W3C trace waterfall and correlated logs
-muobserve-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   traces --trace-id <32-hex-trace-id>
 
 # Run a guarded read-only SQL query across unified hot DuckDB + cold Parquet views
-muobserve-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   sql --query "SELECT repo_key, status_state, COUNT(*) AS jobs FROM v_jobs_history GROUP BY repo_key, status_state ORDER BY jobs DESC"
 ```

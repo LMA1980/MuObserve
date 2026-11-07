@@ -1,0 +1,10 @@
+version: "1"
+service: "mu-observable-hub.service"
+target_nodes:
+  - "node-a"
+lease_ttl_seconds: 300
+warmup_timeout_seconds: 30
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
+integration_tests: "all"

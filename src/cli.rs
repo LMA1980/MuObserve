@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use duckdb::Connection;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     CanarySloAssertionRequest, CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot,
     RegressionGateRequest,
 };
@@ -393,7 +393,7 @@ pub fn execute_cli_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{
+    use mu_observable_ipc::{
         QueryBranchSnapshotsRequest, QueryJobsHistoryRequest, QuerySubmoduleSnapshotsRequest,
     };
     use tempfile::tempdir;

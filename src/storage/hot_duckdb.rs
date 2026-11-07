@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::record_batch::RecordBatch;
 use duckdb::{params, Connection};
-use muobserve_ipc::{
+use mu_observable_ipc::{
     record_batch_to_benchmark_runs, record_batch_to_log_entries, record_batch_to_metric_entries,
     record_batch_to_span_entries, record_batch_to_test_runs, BenchmarkRunEntry,
     CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot, OtelLogEntry,
@@ -1223,7 +1223,7 @@ impl HotDuckDbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{
+    use mu_observable_ipc::{
         benchmark_runs_to_record_batch, log_entries_to_record_batch,
         metric_entries_to_record_batch, span_entries_to_record_batch, test_runs_to_record_batch,
     };

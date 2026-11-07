@@ -1,10 +1,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use muobserve::{
+use mu_observable_hub::{
     build_console_api_router, CompactorConfig, HotDuckDbStore, McpServer, ParquetCompactor,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     BenchmarkRunEntry, CentralSubmoduleSnapshot, OtelLogEntry, OtelMetricEntry, OtelSpanEntry,
     TestCaseRunEntry,
 };
