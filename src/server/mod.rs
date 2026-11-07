@@ -3,9 +3,10 @@ pub mod mtls_ingest;
 pub mod sanitize;
 
 pub use console_api::{
-    build_console_api_router, collect_storage_health_status, query_sanitized_logs,
-    query_sanitized_metrics, ClusterEfficiencyItem, ConsoleLogItem, LogsQueryResponse,
-    MetricTimeseriesPoint, MetricsTimeseriesResponse, StoreStatusResponse,
+    build_console_api_router, collect_storage_health_status, query_sanitized_job_log,
+    query_sanitized_logs, query_sanitized_logs_with_job, query_sanitized_metrics,
+    ClusterEfficiencyItem, ConsoleLogItem, LogsQueryResponse, MetricTimeseriesPoint,
+    MetricsTimeseriesResponse, StoreStatusResponse,
 };
 pub use mtls_ingest::{
     build_mtls_server_config, build_sandbox_execution_plan, dispatch_frame, extract_cert_sans,
