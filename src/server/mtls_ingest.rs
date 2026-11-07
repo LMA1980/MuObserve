@@ -2,16 +2,16 @@ use std::ffi::OsString;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use mu_isolation::{
     EffectiveSandboxPolicy, IsolationBackend, KernelSandbox, NetworkEgressMode, SandboxBackendKind,
     SandboxExecutionPlan,
 };
 use muobserve_ipc::{
-    decode_benchmark_run_batch, decode_control_envelope, decode_log_batch, decode_metric_batch,
-    decode_span_batch, decode_test_run_batch, encode_control_envelope, read_frame, write_frame,
-    ControlRpcEnvelope, DeterministicSecretRedactor, IpcHeader, QueryBranchSnapshotsResponse,
+    create_fory_registry, decode_benchmark_run_batch, decode_log_batch, decode_metric_batch,
+    decode_span_batch, decode_test_run_batch, read_frame, write_frame, ControlRpcEnvelope,
+    DeterministicSecretRedactor, IpcError, IpcHeader, QueryBranchSnapshotsResponse,
     QueryJobsHistoryResponse, QuerySubmoduleSnapshotsResponse, UpsertJobRecordResponse,
     WalBatchAck, MSG_TYPE_ARROW_BENCH_RUNS, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_ARROW_OTEL_METRICS,
     MSG_TYPE_ARROW_OTEL_SPANS, MSG_TYPE_ARROW_TEST_RUNS, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK,
@@ -400,9 +400,9 @@ pub fn dispatch_frame(
             encode_wal_ack_frame(header.sequence, accepted_rows, true, None)
         }
         MSG_TYPE_FORY_CONTROL => {
-            let req_env = decode_control_envelope(payload)?;
+            let req_env = decode_control_envelope_shared(payload)?;
             let resp_env = dispatch_control_rpc(store, req_env)?;
-            let resp_bytes = encode_control_envelope(&resp_env)?;
+            let resp_bytes = encode_control_envelope_shared(&resp_env)?;
             let resp_hdr = IpcHeader::new(
                 MSG_TYPE_FORY_CONTROL,
                 resp_bytes.len() as u32,
@@ -415,6 +415,32 @@ pub fn dispatch_frame(
             "Unsupported MUOB frame message type: {other:#06x}"
         ))),
     }
+}
+
+fn shared_fory_registry() -> Result<&'static fory::Fory, IpcError> {
+    static SHARED_FORY: OnceLock<fory::Fory> = OnceLock::new();
+    if let Some(fory) = SHARED_FORY.get() {
+        return Ok(fory);
+    }
+    let built = create_fory_registry()?;
+    let _ = SHARED_FORY.set(built);
+    SHARED_FORY.get().ok_or_else(|| {
+        IpcError::Fory(fory::Error::invalid_data(
+            "Failed to initialize shared Fory registry",
+        ))
+    })
+}
+
+fn encode_control_envelope_shared(envelope: &ControlRpcEnvelope) -> Result<Vec<u8>, IpcError> {
+    let fory = shared_fory_registry()?;
+    let mut buf = Vec::new();
+    fory.serialize_to(&mut buf, envelope)?;
+    Ok(buf)
+}
+
+fn decode_control_envelope_shared(bytes: &[u8]) -> Result<ControlRpcEnvelope, IpcError> {
+    let fory = shared_fory_registry()?;
+    Ok(fory.deserialize::<ControlRpcEnvelope>(bytes)?)
 }
 
 fn encode_wal_ack_frame(
@@ -430,7 +456,7 @@ fn encode_wal_ack_frame(
         error_message,
     };
     let env = ControlRpcEnvelope::WalAck(ack);
-    let bytes = encode_control_envelope(&env)?;
+    let bytes = encode_control_envelope_shared(&env)?;
     let hdr = IpcHeader::new(MSG_TYPE_WAL_ACK, bytes.len() as u32, 0, sequence);
     Ok((hdr, bytes))
 }
@@ -715,7 +741,7 @@ mod tests {
             dispatch_frame(&store, &config, &attr, &valid_hdr, &valid_payload)
                 .expect("dispatch valid batch");
         assert_eq!(ack_hdr.msg_type, MSG_TYPE_WAL_ACK);
-        let decoded_env = decode_control_envelope(&ack_bytes).expect("decode ack");
+        let decoded_env = decode_control_envelope_shared(&ack_bytes).expect("decode ack");
         assert_eq!(
             decoded_env,
             ControlRpcEnvelope::WalAck(CollectorBatchAck {
@@ -771,11 +797,11 @@ mod tests {
             branch_snapshot: None,
             submodule_snapshots: Vec::new(),
         });
-        let req_bytes = encode_control_envelope(&req_env).unwrap();
+        let req_bytes = encode_control_envelope_shared(&req_env).unwrap();
         let req_hdr = IpcHeader::new(MSG_TYPE_FORY_CONTROL, req_bytes.len() as u32, 0, 1);
 
         let (_, resp_bytes) = dispatch_frame(&store, &config, &attr, &req_hdr, &req_bytes).unwrap();
-        let resp_env = decode_control_envelope(&resp_bytes).unwrap();
+        let resp_env = decode_control_envelope_shared(&resp_bytes).unwrap();
         assert!(matches!(
             resp_env,
             ControlRpcEnvelope::UpsertJobRecordResp(UpsertJobRecordResponse {
@@ -792,16 +818,24 @@ mod tests {
             job_id: None,
             limit: 10,
         });
-        let q_bytes = encode_control_envelope(&q_env).unwrap();
+        let q_bytes = encode_control_envelope_shared(&q_env).unwrap();
         let q_hdr = IpcHeader::new(MSG_TYPE_FORY_CONTROL, q_bytes.len() as u32, 0, 2);
         let (_, q_resp_bytes) = dispatch_frame(&store, &config, &attr, &q_hdr, &q_bytes).unwrap();
-        let q_resp = decode_control_envelope(&q_resp_bytes).unwrap();
+        let q_resp = decode_control_envelope_shared(&q_resp_bytes).unwrap();
         match q_resp {
             ControlRpcEnvelope::QueryJobsHistoryResp(r) => {
                 assert_eq!(r.records, vec![job]);
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        // Verify shared Fory registry singleton pointer identity across repeated calls
+        let reg1 = shared_fory_registry().expect("shared fory 1");
+        let reg2 = shared_fory_registry().expect("shared fory 2");
+        assert!(
+            std::ptr::eq(reg1, reg2),
+            "shared_fory_registry must return a single static Fory instance to avoid TLS ContextCache leaks"
+        );
 
         // Verify MuIsolation KernelSandbox execution plan
         let dir = tempdir().unwrap();
