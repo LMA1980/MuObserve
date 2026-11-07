@@ -1,5 +1,5 @@
 use duckdb::params;
-use muobserve_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
+use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
 
 use crate::error::MuObserveError;
 use crate::storage::hot_duckdb::HotDuckDbStore;
@@ -164,7 +164,7 @@ fn compute_percentile(sorted_or_unsorted: &mut [f64], q: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{OtelLogEntry, OtelSpanEntry};
+    use mu_observable_ipc::{OtelLogEntry, OtelSpanEntry};
 
     #[test]
     #[cfg_attr(miri, ignore)]

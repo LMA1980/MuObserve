@@ -7,10 +7,10 @@ pub enum MuObserveError {
     DuckDb(#[from] duckdb::Error),
 
     #[error("IPC wire error: {0}")]
-    Ipc(#[from] muobserve_ipc::IpcError),
+    Ipc(#[from] mu_observable_ipc::IpcError),
 
     #[error("Isolation sandbox error: {0}")]
-    Isolation(#[from] mu_isolation::IsolationError),
+    Isolation(#[from] mu_ci_isolation::IsolationError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

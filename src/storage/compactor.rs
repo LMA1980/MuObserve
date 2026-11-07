@@ -239,7 +239,7 @@ fn list_parquet_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{BenchmarkRunEntry, OtelLogEntry};
+    use mu_observable_ipc::{BenchmarkRunEntry, OtelLogEntry};
     use tempfile::tempdir;
 
     #[test]

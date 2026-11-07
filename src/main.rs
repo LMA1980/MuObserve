@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use muobserve::{
+use mu_observable_hub::{
     build_mtls_server_config, execute_cli_command, parse_cli_args, HotDuckDbStore,
     IngestServerConfig, McpServer, MtlsIngestServer, SanEnforcementPolicy,
 };
@@ -20,7 +20,7 @@ async fn main() {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         if let Err(e) = mcp.serve_stdio(stdin.lock(), stdout.lock()) {
-            eprintln!("muobserve mcp-stdio error: {e}");
+            eprintln!("mu-observable-hub mcp-stdio error: {e}");
             std::process::exit(1);
         }
         return;
@@ -100,11 +100,11 @@ async fn main() {
             %listen_addr,
             db = %db_path.display(),
             parquet = %parquet_root.display(),
-            "muobserve v{} mTLS ingestion & Fory RPC server listening",
+            "mu-observable-hub v{} mTLS ingestion & Fory RPC server listening",
             env!("CARGO_PKG_VERSION")
         );
         if let Err(e) = server.serve(listener).await {
-            eprintln!("muobserve server error: {e}");
+            eprintln!("mu-observable-hub server error: {e}");
             std::process::exit(1);
         }
         return;
@@ -124,7 +124,7 @@ async fn main() {
                         return;
                     }
                     Err(e) => {
-                        eprintln!("muobserve error: {e}");
+                        eprintln!("mu-observable-hub error: {e}");
                         std::process::exit(1);
                     }
                 }
@@ -136,8 +136,8 @@ async fn main() {
     }
 
     println!(
-        "muobserve v{} initialized (hot retention window: {} days)",
+        "mu-observable-hub v{} initialized (hot retention window: {} days)",
         env!("CARGO_PKG_VERSION"),
-        muobserve::DEFAULT_HOT_RETENTION_DAYS
+        mu_observable_hub::DEFAULT_HOT_RETENTION_DAYS
     );
 }

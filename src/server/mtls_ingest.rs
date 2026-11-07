@@ -4,11 +4,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use mu_isolation::{
+use mu_ci_isolation::{
     EffectiveSandboxPolicy, IsolationBackend, KernelSandbox, NetworkEgressMode, SandboxBackendKind,
     SandboxExecutionPlan,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     create_fory_registry, decode_benchmark_run_batch, decode_log_batch, decode_metric_batch,
     decode_span_batch, decode_test_run_batch, read_frame, write_frame, ControlRpcEnvelope,
     DeterministicSecretRedactor, IpcError, IpcHeader, QueryBranchSnapshotsResponse,
@@ -281,7 +281,7 @@ pub fn build_sandbox_execution_plan(
         require_set_ai_thread: false,
     };
     sandbox.validate_host_support(&policy)?;
-    let argv = vec![OsString::from("/usr/local/bin/muobserve")];
+    let argv = vec![OsString::from("/usr/local/bin/mu-observable-hub")];
     let plan = sandbox.build_execution_plan(&policy, &argv)?;
     Ok(plan)
 }
@@ -663,7 +663,7 @@ impl MtlsIngestServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{
+    use mu_observable_ipc::{
         encode_log_batch, CentralJobRecord, OtelLogEntry, QueryJobsHistoryRequest,
         UpsertJobRecordRequest,
     };

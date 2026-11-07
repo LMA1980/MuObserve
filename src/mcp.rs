@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use duckdb::params;
-use muobserve_ipc::{CanarySloAssertionRequest, RegressionGateRequest};
+use mu_observable_ipc::{CanarySloAssertionRequest, RegressionGateRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -228,7 +228,7 @@ impl McpServer {
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": {} },
                     "serverInfo": {
-                        "name": "muobserve-mcp",
+                        "name": "mu-observable-mcp",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
@@ -722,7 +722,7 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{
+    use mu_observable_ipc::{
         BenchmarkRunEntry, OtelLogEntry, OtelMetricEntry, OtelSpanEntry, TestCaseRunEntry,
     };
 

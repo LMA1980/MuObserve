@@ -839,7 +839,7 @@ fn round_metric(v: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muobserve_ipc::{OtelLogEntry, OtelSpanEntry};
+    use mu_observable_ipc::{OtelLogEntry, OtelSpanEntry};
 
     #[test]
     #[cfg_attr(miri, ignore)]

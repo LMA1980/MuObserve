@@ -3,13 +3,13 @@ use std::io::Cursor;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use muobserve::{
+use mu_observable_hub::{
     build_mtls_server_config, dispatch_frame, execute_cli_command, parse_cli_args,
     resolve_san_identity, CompactorConfig, HotDuckDbStore, IngestServerConfig, JsonRpcRequest,
     JsonRpcResponse, McpServer, MtlsIngestServer, ParquetCompactor, SanAttribution,
     SanEnforcementPolicy, MSG_TYPE_ARROW_LOGS, MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     decode_control_envelope, encode_benchmark_run_batch, encode_control_envelope, encode_log_batch,
     encode_metric_batch, encode_span_batch, encode_test_run_batch, write_frame, BenchmarkRunEntry,
     CanarySloAssertionRequest, CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot,
@@ -69,12 +69,12 @@ async fn test_end_to_end_mtls_stream_arrow_and_fory_pipeline() {
         .await
         .expect("handle single frame on stream");
 
-    let (ack_hdr, ack_payload) = muobserve_ipc::read_frame(&mut client).await.unwrap();
+    let (ack_hdr, ack_payload) = mu_observable_ipc::read_frame(&mut client).await.unwrap();
     assert_eq!(ack_hdr.msg_type, MSG_TYPE_WAL_ACK);
     let ack_env = decode_control_envelope(&ack_payload).unwrap();
     assert!(matches!(
         ack_env,
-        ControlRpcEnvelope::WalAck(muobserve_ipc::WalBatchAck {
+        ControlRpcEnvelope::WalAck(mu_observable_ipc::WalBatchAck {
             sequence: 10,
             accepted_rows: 1,
             ok: true,
