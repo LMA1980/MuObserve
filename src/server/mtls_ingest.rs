@@ -340,17 +340,29 @@ pub fn dispatch_frame(
             let mut entries = decode_log_batch(payload)?;
             let redactor = DeterministicSecretRedactor::new();
             for e in &mut entries {
-                enforce_san_on_item(
-                    attribution,
-                    config.san_policy,
-                    &mut e.node_id,
-                    Some(&mut e.service_name),
-                )?;
+                let preserve_job_origin = e
+                    .job_id
+                    .as_deref()
+                    .map(|j| !j.trim().is_empty())
+                    .unwrap_or(false)
+                    && !e.node_id.trim().is_empty();
+                if !preserve_job_origin {
+                    enforce_san_on_item(
+                        attribution,
+                        config.san_policy,
+                        &mut e.node_id,
+                        Some(&mut e.service_name),
+                    )?;
+                } else if e.service_name.trim().is_empty() {
+                    if let Some(expected_svc) = attribution.service_name.as_ref() {
+                        e.service_name = expected_svc.clone();
+                    }
+                }
                 if config.redact_on_ingest {
                     e.redact_in_place(&redactor);
                 }
             }
-            let accepted_rows = store.insert_logs_batch(&entries)?;
+            let accepted_rows = store.insert_logs(&entries)?;
             encode_wal_ack_frame(header.sequence, accepted_rows, true, None)
         }
         MSG_TYPE_ARROW_OTEL_SPANS => {

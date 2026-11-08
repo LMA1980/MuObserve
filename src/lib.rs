@@ -26,26 +26,27 @@ pub use cli::{
     execute_cli_command, migrate_actionrunner_duckdb, parse_cli_args, ActionRunnerMigrationReport,
     CliCommand,
 };
-pub use error::MuObserveError;
+pub use error::{MuObserveError, StorageError};
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, MCP_TOOL_NAMES};
 pub use server::{
     alias_internal_hostnames, anonymize_ipv4_rfc5737, build_console_api_router,
     build_mtls_server_config, build_sandbox_execution_plan, collect_storage_health_status,
     dispatch_frame, extract_cert_sans, fqdn_to_shortname, mask_ipv4_third_octet,
     query_sanitized_job_log, query_sanitized_logs, query_sanitized_logs_with_job,
-    query_sanitized_metrics, resolve_san_identity, sanitize_console_value, scrub_host_paths,
-    scrub_secrets_and_tokens, trim_path_last_two_segments, ClusterEfficiencyItem,
-    CollectorBatchAck, ConsoleLogItem, IngestServerConfig, LogsQueryResponse,
-    MetricTimeseriesPoint, MetricsTimeseriesResponse, MtlsIngestServer, PrivacyRedactor,
-    SanAttribution, SanEnforcementPolicy, StoreStatusResponse, MSG_TYPE_ARROW_LOGS,
-    MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS,
+    query_sanitized_logs_with_token, query_sanitized_metrics, resolve_san_identity,
+    sanitize_console_value, scrub_host_paths, scrub_secrets_and_tokens,
+    trim_path_last_two_segments, ClusterEfficiencyItem, CollectorBatchAck, ConsoleLogItem,
+    IngestServerConfig, LogsQueryResponse, MetricTimeseriesPoint, MetricsTimeseriesResponse,
+    MtlsIngestServer, PrivacyRedactor, SanAttribution, SanEnforcementPolicy, SanitizedLogRecord,
+    StoreStatusResponse, MSG_TYPE_ARROW_LOGS, MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS,
 };
 pub use sql_guard::{
     execute_guarded_sql, validate_readonly_sql, SqlQueryResult, DEFAULT_SQL_MAX_ROWS,
     DEFAULT_SQL_TIMEOUT_MS,
 };
 pub use storage::{
-    register_unified_views, CompactionReport, CompactorConfig, HotDuckDbStore, ParquetCompactor,
+    available_disk_bytes, compute_log_dedup_hash, register_unified_views, tokenize_log_line,
+    CompactionReport, CompactorConfig, HotDuckDbStore, ParquetCompactor,
 };
 
 #[cfg(test)]

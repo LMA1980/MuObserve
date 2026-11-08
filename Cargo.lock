@@ -1231,6 +1231,7 @@ dependencies = [
  "fory",
  "hex",
  "http-body-util",
+ "libc",
  "mu-ci-isolation",
  "mu-observable-ipc",
  "rcgen",
