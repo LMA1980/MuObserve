@@ -39,7 +39,13 @@ mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
 mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   traces --trace-id <32-hex-trace-id>
 
-# Run a guarded read-only SQL query across unified hot DuckDB + cold Parquet views
+# Join and query across unified hot DuckDB + cold Parquet views
 mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
   sql --query "SELECT repo_key, status_state, COUNT(*) AS jobs FROM v_jobs_history GROUP BY repo_key, status_state ORDER BY jobs DESC"
 ```
+
+## 3. Line-Indexed Log Store & Strict FIFO Eviction Invariants
+
+- **1 Line = 1 Record (`otel_logs`)**: Every log line is stored individually with `line_no`, `stream` (`1` = stdout, `2` = stderr), and 64-bit FNV-1a `dedup_hash`. Full-file `job_logs_store` (`__ar_job_logs__`) blobs are retired; `/api/v1/jobs/{job_id}/log` reconstructs logs from `v_logs` ordered by `(line_no ASC, timestamp_unix_nano ASC)`.
+- **Inverted Token Index (`log_inverted_index`) & Shard Catalog (`log_shards_catalog`)**: Each inserted log line indexes up to 32 normalized lowercase tokens in `log_inverted_index` and tracks segment placement across `hot`, `cold_parquet`, and `cold_s3`.
+- **Strict FIFO Time & Disk-Space Eviction**: `enforce_fifo_time_and_space_eviction` evicts oldest shards and rows strictly by timestamp when TTL expires or `libc::statvfs` free disk bytes (`MUOBSERVE_MIN_FREE_DISK_BYTES`, default `2 GiB`) / total store bytes (`MUOBSERVE_MAX_STORE_BYTES`, default `4 GiB`) crosses threshold.
