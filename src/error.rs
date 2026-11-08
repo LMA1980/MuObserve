@@ -36,3 +36,6 @@ pub enum MuObserveError {
     #[error("Internal lock poisoned: {0}")]
     LockPoisoned(String),
 }
+
+/// Alias for [`MuObserveError`] used across storage layer APIs.
+pub type StorageError = MuObserveError;

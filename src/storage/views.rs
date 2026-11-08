@@ -9,7 +9,7 @@ const VIEW_SPECS: &[(&str, &str, &str, &str)] = &[
         "v_logs",
         "otel_logs",
         "logs",
-        "timestamp_unix_nano, trace_id, span_id, severity_number, severity_text, service_name, node_id, body, attributes_json, job_id, stage_id",
+        "timestamp_unix_nano, trace_id, span_id, severity_number, severity_text, service_name, node_id, body, attributes_json, job_id, stage_id, COALESCE(line_no, 0::UINTEGER) AS line_no, COALESCE(stream, 1::UTINYINT) AS stream, COALESCE(dedup_hash, 0::UBIGINT) AS dedup_hash",
     ),
     (
         "v_traces",
@@ -66,9 +66,11 @@ pub fn register_unified_views(
             );
             format!(
                 "CREATE OR REPLACE VIEW {view_name} AS \
-                 SELECT {cols} FROM {hot_table} \
-                 UNION ALL \
-                 SELECT {cols} FROM read_parquet('{glob_pattern}', hive_partitioning = true, union_by_name = true);"
+                 SELECT {cols} FROM ( \
+                     SELECT * FROM {hot_table} \
+                     UNION ALL BY NAME \
+                     SELECT * FROM read_parquet('{glob_pattern}', hive_partitioning = true, union_by_name = true) \
+                 );"
             )
         };
         conn.execute_batch(&sql)?;
