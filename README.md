@@ -22,9 +22,10 @@ Distributed **OpenTelemetry (OTEL) + DuckDB/Parquet** observability backend, cen
 - **Zero-Trust `step-ca` mTLS Ingestion & Centralized State**:
   - Verifies client certificate DNS/URI SANs to enforce cryptographic node and service attribution.
   - Hosts the centralized `ActionRunner-controller` operational catalog (`jobs_history`, `branch_snapshots`, `submodule_snapshots`) alongside unified `otel_spans`, `otel_logs`, `otel_metrics`, `test_case_runs`, and `benchmark_runs`.
-- **3-Tier Hybrid DuckDB + Zstd Parquet Storage Lifecycle**:
-  - **Hot Tier (`/var/lib/muobserve/hot.duckdb`)**: Fast indexed DuckDB tables for the active 7-day window and live CI state.
-  - **Cold Tier (`/var/lib/muobserve/parquet/signal=<type>/year=YYYY/month=MM/`)**: Scheduled background compaction into Hive-partitioned Zstd Parquet files on Btrfs RAID1, queried transparently via unified DuckDB views (`v_logs`, `v_traces`, `v_metrics`, `v_tests`, `v_benchmarks`).
+- **3-Tier Hybrid DuckDB + Zstd Parquet Storage Lifecycle & OpenSearch-Style Line Index**:
+  - **Single-Line Deduplicated Log Store (`otel_logs`)**: Stores every CI and daemon log line once (`1 line = 1 record`) with `line_no`, `stream`, and a deterministic 64-bit FNV-1a `dedup_hash` (bounded 65,536-entry FIFO ring + SQL `WHERE NOT EXISTS` guard), retiring full-file `job_logs_store` (`__ar_job_logs__`) blob rewrites.
+  - **Inverted Token Index & Shard Catalog (`log_inverted_index`, `log_shards_catalog`)**: Indexes up to 32 normalized lowercase tokens per log line in local DuckDB and tracks hot and cold Zstd Parquet / Garage S3 (`cold_parquet` / `cold_s3`) segments for sub-millisecond keyword search and ordered line-by-line `/api/v1/jobs/{job_id}/log` reconstruction.
+  - **Strict FIFO Time & Disk-Space Eviction**: Evicts oldest cold shards and hot records strictly in FIFO timestamp order whenever retention TTL expires or available physical disk space (`libc::statvfs` vs `MUOBSERVE_MIN_FREE_DISK_BYTES`) / store byte ceiling (`MUOBSERVE_MAX_STORE_BYTES`) is exceeded. See [`specs/line-indexed-log-store-and-fifo-eviction.md`](specs/line-indexed-log-store-and-fifo-eviction.md).
 - **Hardware-Aware Benchmark & Test Regression Engine**:
   - Compares `feat/**` candidate runs against rolling `main` baselines stratified by hardware profile (`arch`, `cpu_cluster` e.g. `X100` `VLEN=256` vs `A100` `VLEN=1024` vs `x86_64`), computing relative deltas and MAD modified $z$-scores, plus rolling 30-day test flakiness indices.
 - **Antigravity MCP Server (`mu-observable-mcp`) & CLI (`mu-observable-cli`)**:
