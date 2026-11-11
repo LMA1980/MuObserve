@@ -76,6 +76,18 @@ pub struct McpServer {
     store: HotDuckDbStore,
 }
 
+fn block_on_future<F: std::future::Future>(future: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build tokio runtime")
+            .block_on(future)
+    }
+}
+
 impl McpServer {
     /// Creates a new [`McpServer`] backed by `store`.
     #[must_use]
@@ -687,6 +699,15 @@ impl McpServer {
                     .into_iter()
                     .find(|p| p.root_cause_trace_id.as_deref() == Some(&trace_id))
                 {
+                    let ai_diag =
+                        block_on_future(crate::analytics::causal::synthesize_ai_diagnosis(
+                            &card.impacted_entity,
+                            &card.root_cause_service,
+                            &card.causal_chain,
+                            card.root_cause_error_message.as_deref(),
+                            &card.slo_metric,
+                            card.confidence_score,
+                        ));
                     Ok(json!({
                         "trace_id": trace_id,
                         "problem_id": card.problem_id,
@@ -694,23 +715,25 @@ impl McpServer {
                         "root_cause_service": card.root_cause_service,
                         "causal_chain": card.causal_chain,
                         "confidence_score": card.confidence_score,
-                        "ai_diagnosis": card.ai_diagnosis,
+                        "ai_diagnosis": ai_diag,
                         "summary": card.summary,
                     }))
                 } else {
-                    let fallback_diag = crate::analytics::causal::generate_statistical_diagnosis(
-                        &service_name,
-                        &service_name,
-                        std::slice::from_ref(&service_name),
-                        None,
-                        "trace_inspection",
-                        0.70,
-                    );
+                    let fallback_chain = vec![service_name.clone()];
+                    let ai_diag =
+                        block_on_future(crate::analytics::causal::synthesize_ai_diagnosis(
+                            &service_name,
+                            &service_name,
+                            &fallback_chain,
+                            None,
+                            "trace_inspection",
+                            0.70,
+                        ));
                     Ok(json!({
                         "trace_id": trace_id,
-                        "impacted_entity": service_name,
+                        "impacted_entity": service_name.clone(),
                         "root_cause_service": service_name,
-                        "ai_diagnosis": fallback_diag,
+                        "ai_diagnosis": ai_diag,
                     }))
                 }
             }

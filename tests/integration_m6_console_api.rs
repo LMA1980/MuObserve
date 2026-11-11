@@ -401,6 +401,7 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/ingress/tls")
+                .header("authorization", "Bearer test-admin-token")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&tls_payload).unwrap()))
                 .unwrap(),

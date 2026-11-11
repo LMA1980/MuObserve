@@ -118,13 +118,10 @@ pub fn sanitize_console_value(input: &str) -> String {
 /// `worker-riscv64`) and replaces internal domain suffixes with `.example.invalid`.
 #[must_use]
 pub fn alias_internal_hostnames(input: &str) -> String {
-    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
     let with_hosts = replace_internal_host_tokens(input);
-    replace_case_insensitive(
-        &with_hosts,
-        std::str::from_utf8(RAW_D).unwrap(),
-        ".example.invalid",
-    )
+    let s1 = replace_case_insensitive(&with_hosts, ".corp.internal", ".example.invalid");
+    let s2 = replace_case_insensitive(&s1, ".local", ".example.invalid");
+    replace_case_insensitive(&s2, ".internal", ".example.invalid")
 }
 
 fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
@@ -133,23 +130,20 @@ fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
 
 fn replace_internal_host_tokens(input: &str) -> String {
     let mut s = input.to_string();
-    if let Ok(mappings) = std::env::var("MUOBSERVE_HOSTNAME_ALIASES") {
+    let mappings_res =
+        std::env::var("MUOBSERVE_HOSTNAME_ALIASES").or_else(|_| std::env::var("MUCONDE_NODE_MAP"));
+    if let Ok(mappings) = mappings_res {
         for pair in mappings.split(',') {
-            if let Some((k, v)) = pair.split_once(':') {
-                s = replace_token_boundary_ci(&s, k.trim(), v.trim());
+            if let Some((k, v)) = pair.split_once(':').or_else(|| pair.split_once('=')) {
+                let k_trim = k.trim();
+                let v_trim = v.trim();
+                if !k_trim.is_empty() && !v_trim.is_empty() {
+                    s = replace_token_boundary_ci(&s, k_trim, v_trim);
+                }
             }
         }
     }
-    // Byte-escaped tokens ensure plain-text grep in public repos never matches private hostnames
-    const RAW_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
-    const RAW_PU: &[u8] = b"\x70\x65\x79\x5f\x77\x61\x69\x6c\x5f\x64\x65\x75";
-    const RAW_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
-    const RAW_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
-
-    let s1 = replace_token_boundary_ci(&s, std::str::from_utf8(RAW_P).unwrap(), "worker-riscv64");
-    let s2 = replace_token_boundary_ci(&s1, std::str::from_utf8(RAW_PU).unwrap(), "worker-riscv64");
-    let s3 = replace_token_boundary_ci(&s2, std::str::from_utf8(RAW_E).unwrap(), "node-a");
-    replace_token_boundary_ci(&s3, std::str::from_utf8(RAW_R).unwrap(), "node-b")
+    s
 }
 
 fn replace_token_boundary_ci(input: &str, needle: &str, replacement: &str) -> String {
@@ -233,15 +227,15 @@ pub fn fqdn_to_shortname(input: &str) -> String {
 }
 
 fn strip_embedded_internal_domains(input: &str) -> String {
-    const RAW_CI: &[u8] = b"\x2e\x63\x69\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-    const RAW_CD: &[u8] = b"\x2e\x63\x64\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-
     let mut current = input.to_string();
-    let s_ci = std::str::from_utf8(RAW_CI).unwrap();
-    let s_cd = std::str::from_utf8(RAW_CD).unwrap();
-    let s_d = std::str::from_utf8(RAW_D).unwrap();
-    for suffix in &[s_ci, s_cd, s_d, ".cluster.internal", ".example.invalid"] {
+    for suffix in &[
+        ".cluster.internal",
+        ".corp.internal",
+        ".example.invalid",
+        ".internal",
+        ".local",
+        ".lan",
+    ] {
         current = replace_case_insensitive(&current, suffix, "");
     }
     current
@@ -664,20 +658,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const RAW_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
-    const RAW_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
-    const RAW_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
-    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-    const RAW_IP: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e\x31\x2e\x31\x31\x37";
-    const RAW_IP_PRE: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e";
-    const RAW_IP2: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e\x31\x30\x2e\x35\x35";
+    const TEST_HOST_P: &str = "test-worker-riscv";
+    const TEST_HOST_E: &str = "test-host-alpha";
+    const TEST_HOST_R: &str = "test-host-beta";
+    const TEST_DOMAIN_SUFFIX: &str = ".corp.internal";
+    const TEST_IP: &str = "192.168.100.50";
+    const TEST_IP_PRE: &str = "192.168.";
+    const TEST_IP2: &str = "192.168.100.55";
+
+    fn init_test_aliases() {
+        std::env::set_var(
+            "MUOBSERVE_HOSTNAME_ALIASES",
+            "test-host-alpha:node-a,test-host-beta:node-b,test-worker-riscv:worker-riscv64",
+        );
+    }
 
     #[test]
     fn test_stage1_hostname_and_domain_aliasing() {
-        let p = std::str::from_utf8(RAW_P).unwrap();
-        let e = std::str::from_utf8(RAW_E).unwrap();
-        let r = std::str::from_utf8(RAW_R).unwrap();
-        let d = std::str::from_utf8(RAW_D).unwrap();
+        init_test_aliases();
+        let p = TEST_HOST_P;
+        let e = TEST_HOST_E;
+        let r = TEST_HOST_R;
+        let d = TEST_DOMAIN_SUFFIX;
 
         assert_eq!(alias_internal_hostnames(e), "node-a");
         assert_eq!(alias_internal_hostnames(r), "node-b");
@@ -694,10 +696,10 @@ mod tests {
 
     #[test]
     fn test_stage2_ipv4_rfc5737_and_third_octet_masking() {
-        let ip = std::str::from_utf8(RAW_IP).unwrap();
-        let ip_pre = std::str::from_utf8(RAW_IP_PRE).unwrap();
+        let ip = TEST_IP;
+        let ip_pre = TEST_IP_PRE;
 
-        assert_eq!(mask_ipv4_third_octet(ip), format!("{ip_pre}###.117"));
+        assert_eq!(mask_ipv4_third_octet(ip), format!("{ip_pre}###.50"));
         assert_eq!(
             mask_ipv4_third_octet("peer=10.0.42.9:9443"),
             "peer=10.0.###.9:9443"
@@ -739,10 +741,11 @@ mod tests {
             "file .../src/main.rs:42"
         );
 
+        init_test_aliases();
         let redactor = PrivacyRedactor::new();
-        let e = std::str::from_utf8(RAW_E).unwrap();
-        let d = std::str::from_utf8(RAW_D).unwrap();
-        let ip = std::str::from_utf8(RAW_IP).unwrap();
+        let e = TEST_HOST_E;
+        let d = TEST_DOMAIN_SUFFIX;
+        let ip = TEST_IP;
         let dirty = format!("host={e}{d} ip={ip} auth=Bearer eyJhbGciOiJIUzI1NiJ9 pat=ghp_1234567890abcdef gl=glpat-xyz987654 db=/var/lib/muobserve/db/hot.duckdb cfg=/etc/muobserve/tls/server.key home=/Users/alice/.ssh/id_ed25519");
         let clean = redactor.redact_str(&dirty);
 
@@ -763,14 +766,15 @@ mod tests {
 
     #[test]
     fn test_property_zero_leakage_across_arbitrary_corpus_and_json_dtos() {
+        init_test_aliases();
         let redactor = PrivacyRedactor::new();
-        let p = std::str::from_utf8(RAW_P).unwrap();
-        let e = std::str::from_utf8(RAW_E).unwrap();
-        let r = std::str::from_utf8(RAW_R).unwrap();
-        let d = std::str::from_utf8(RAW_D).unwrap();
-        let ip = std::str::from_utf8(RAW_IP).unwrap();
-        let ip_pre = std::str::from_utf8(RAW_IP_PRE).unwrap();
-        let ip2 = std::str::from_utf8(RAW_IP2).unwrap();
+        let p = TEST_HOST_P;
+        let e = TEST_HOST_E;
+        let r = TEST_HOST_R;
+        let d = TEST_DOMAIN_SUFFIX;
+        let ip = TEST_IP;
+        let ip_pre = TEST_IP_PRE;
+        let ip2 = TEST_IP2;
 
         let s1 = format!("ssh root@{e}{d} -i /home/admin/.ssh/id_rsa");
         let s2 = format!("worker {p} ({ip2}) connected to {r}{d} (10.20.30.40)");

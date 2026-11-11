@@ -179,6 +179,8 @@ struct LogsQueryParams {
     token: Option<String>,
     q: Option<String>,
     limit: Option<usize>,
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -324,6 +326,39 @@ pub fn build_console_api_router_with_ingress(
         .route("/api/logs/facets", get(handle_get_log_facets))
         .route("/api/v1/logs/aggregations", get(handle_get_log_facets))
         .route("/api/obs/v1/logs/aggregations", get(handle_get_log_facets))
+        // Direct native /api/obs/v1/* route mounts preventing proxy loop
+        .route("/api/obs/v1/smartscape", get(handle_get_smartscape))
+        .route("/api/obs/v1/problems", get(handle_get_problems))
+        .route("/api/obs/v1/events", get(handle_get_problem_events_sse))
+        .route("/api/obs/v1/traces", get(handle_get_traces))
+        .route(
+            "/api/obs/v1/traces/{trace_id}",
+            get(handle_get_trace_purepath),
+        )
+        .route(
+            "/api/obs/v1/traces/{trace_id}/purepath",
+            get(handle_get_trace_purepath),
+        )
+        .route("/api/obs/v1/logs", get(handle_get_logs))
+        .route("/api/obs/v1/jobs/{job_id}/log", get(handle_get_job_log))
+        .route("/api/obs/v1/jobs/{job_id}/logs", get(handle_get_job_log))
+        .route("/api/obs/v1/metrics", get(handle_get_metrics))
+        .route("/api/obs/v1/metrics/timeseries", get(handle_get_metrics))
+        .route("/api/obs/v1/store/status", get(handle_get_store_status))
+        .route("/api/obs/v1/datastore", get(handle_get_store_status))
+        .route(
+            "/api/obs/v1/ingress/routes",
+            get(handle_get_ingress_routes).post(handle_post_ingress_route),
+        )
+        .route("/api/obs/v1/ingress/tls", post(handle_post_ingress_tls))
+        .route(
+            "/api/obs/v1/ingress/upstreams",
+            get(handle_get_ingress_upstreams),
+        )
+        .route(
+            "/api/obs/v1/ingress/overview",
+            get(handle_get_ingress_overview),
+        )
         .fallback(handle_ingress_fallback)
         .with_state(state)
 }
@@ -419,6 +454,22 @@ async fn handle_get_problems(
         }
     }
 
+    // Asynchronously synthesize AI diagnosis across all problems concurrently
+    let synthesis_futures = all_problems.iter().map(|p| {
+        crate::analytics::causal::synthesize_ai_diagnosis(
+            &p.impacted_entity,
+            &p.root_cause_service,
+            &p.causal_chain,
+            p.root_cause_error_message.as_deref(),
+            &p.slo_metric,
+            p.confidence_score,
+        )
+    });
+    let diagnoses = futures_util::future::join_all(synthesis_futures).await;
+    for (p, ai) in all_problems.iter_mut().zip(diagnoses) {
+        p.ai_diagnosis = Some(ai);
+    }
+
     let resp = crate::analytics::causal::CausalProblemsFeedResponse {
         window_secs,
         open_count: all_problems.len(),
@@ -463,10 +514,10 @@ async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> R
                 recv_res = rx.recv() => {
                     match recv_res {
                         Ok(msg) => {
-                            let ev_name = if msg.contains("\"problem_id\"") {
-                                "problem_opened"
-                            } else if msg.contains("\"log_entry\"") {
+                            let ev_name = if msg.contains("\"log_entry\"") {
                                 "log_entry"
+                            } else if msg.contains("\"problem_id\"") {
+                                "problem_opened"
                             } else if msg.contains("\"ingress\"") {
                                 "ingress_changed"
                             } else {
@@ -523,10 +574,180 @@ pub struct IngressRouteCreateRequest {
     pub auth_required: bool,
 }
 
+fn validate_upstream_url_ssrf(url_str: &str) -> Result<(), &'static str> {
+    if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
+        return Err("Invalid scheme: only http:// and https:// are allowed");
+    }
+
+    let trimmed = url_str
+        .strip_prefix("http://")
+        .or_else(|| url_str.strip_prefix("https://"))
+        .unwrap_or(url_str);
+
+    let authority = match trimmed.find('/') {
+        Some(pos) => &trimmed[..pos],
+        None => trimmed,
+    };
+
+    let host_port = match authority.rfind('@') {
+        Some(pos) => &authority[pos + 1..],
+        None => authority,
+    };
+
+    let host = if host_port.starts_with('[') {
+        let close_bracket = match host_port.find(']') {
+            Some(pos) => pos,
+            None => return Err("Malformed IPv6 host: missing closing bracket"),
+        };
+        let raw_host = &host_port[1..close_bracket];
+        let remainder = &host_port[close_bracket + 1..];
+        if !remainder.is_empty() {
+            if let Some(port_str) = remainder.strip_prefix(':') {
+                if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                    return Err("Invalid port in upstream URL");
+                }
+            } else {
+                return Err("Malformed authority: trailing characters after IPv6 bracket");
+            }
+        }
+        raw_host
+    } else {
+        if host_port.chars().filter(|&c| c == ':').count() >= 2 {
+            if let Ok(std::net::IpAddr::V6(ipv6)) = host_port.parse::<std::net::IpAddr>() {
+                if ipv6.is_unspecified() || ipv6.is_unicast_link_local() {
+                    return Err("SSRF blocked: IPv6 address is link-local or unspecified");
+                }
+            }
+            return Err("Malformed IPv6 host: IPv6 addresses must be bracketed in URLs");
+        }
+        if let Some(pos) = host_port.find(':') {
+            let port_str = &host_port[pos + 1..];
+            if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                return Err("Invalid port in upstream URL");
+            }
+            &host_port[..pos]
+        } else {
+            host_port
+        }
+    };
+
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() {
+        return Err("Host cannot be empty");
+    }
+
+    if host == "169.254.169.254"
+        || host.starts_with("169.254.")
+        || host == "0.0.0.0"
+        || host == "255.255.255.255"
+        || host.eq_ignore_ascii_case("metadata.google.internal")
+        || host.eq_ignore_ascii_case("instance-data")
+    {
+        return Err(
+            "SSRF blocked: target host is a restricted metadata, link-local, or wildcard address",
+        );
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                if ipv4.is_link_local() || ipv4.is_unspecified() || ipv4.is_broadcast() {
+                    return Err(
+                        "SSRF blocked: IPv4 address is link-local, unspecified, or broadcast",
+                    );
+                }
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                if ipv6.is_unspecified() || ipv6.is_unicast_link_local() {
+                    return Err("SSRF blocked: IPv6 address is link-local or unspecified");
+                }
+                if let Some(v4) = ipv6.to_ipv4() {
+                    if v4.is_link_local()
+                        || v4.is_unspecified()
+                        || v4.is_broadcast()
+                        || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+                    {
+                        return Err(
+                            "SSRF blocked: IPv4-mapped IPv6 address is link-local, unspecified, or metadata",
+                        );
+                    }
+                }
+            }
+        }
+    } else if host_port.starts_with('[') {
+        return Err("Malformed IPv6 host: not a valid IPv6 address");
+    }
+
+    Ok(())
+}
+
+fn validate_admin_auth(headers: &axum::http::HeaderMap) -> Option<&'static str> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+
+    let token = auth_header
+        .and_then(|val| {
+            val.strip_prefix("Bearer ")
+                .or_else(|| val.strip_prefix("bearer "))
+        })
+        .map(str::trim);
+
+    let expected = std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN")
+        .or_else(|_| std::env::var("MUOBSERVE_OPERATOR_TOKEN"))
+        .or_else(|_| std::env::var("MUOBSERVE_BEARER_TOKEN"));
+
+    match (token, expected) {
+        (Some(presented), Ok(exp)) if !exp.is_empty() => {
+            if crate::ingress::constant_time_eq(presented.as_bytes(), exp.as_bytes()) {
+                None
+            } else {
+                Some("Unauthorized: invalid Ingress admin Bearer token")
+            }
+        }
+        (Some(presented), Err(_)) if !presented.is_empty() => {
+            // When no admin token is explicitly configured in environment, require any non-empty bearer token
+            None
+        }
+        _ => Some("Unauthorized: Ingress admin Bearer token required"),
+    }
+}
+
 async fn handle_post_ingress_route(
     State(engine): State<Arc<IngressEngine>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<IngressRouteCreateRequest>,
 ) -> Response {
+    if let Some(err_msg) = validate_admin_auth(&headers) {
+        return no_store_json(
+            StatusCode::UNAUTHORIZED,
+            &json!({
+                "error": err_msg,
+                "status": 401
+            }),
+        );
+    }
+
+    if let Err(ssrf_err) = validate_upstream_url_ssrf(&payload.upstream_url) {
+        return no_store_json(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": ssrf_err,
+                "status": 400
+            }),
+        );
+    }
+
+    if !payload.path_prefix.starts_with('/') {
+        return no_store_json(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "path_prefix must start with '/'",
+                "status": 400
+            }),
+        );
+    }
+
     engine.add_route(
         &payload.route_id,
         &payload.path_prefix,
@@ -546,8 +767,19 @@ async fn handle_post_ingress_route(
 
 async fn handle_post_ingress_tls(
     State(engine): State<Arc<IngressEngine>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<crate::ingress::TlsHealthDto>,
 ) -> Response {
+    if let Some(err_msg) = validate_admin_auth(&headers) {
+        return no_store_json(
+            StatusCode::UNAUTHORIZED,
+            &json!({
+                "error": err_msg,
+                "status": 401
+            }),
+        );
+    }
+
     engine.set_tls_health(payload).await;
     no_store_json(
         StatusCode::OK,
@@ -633,15 +865,70 @@ async fn handle_get_log_facets(
         Err(e) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
+    let token_query = params.token.as_deref().or(params.q.as_deref());
+    let candidate_hashes = if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
+        match HotDuckDbStore::candidate_hashes_for_query_conn(&conn, tq, params.job_id.as_deref()) {
+            Ok(Some(hashes)) if hashes.is_empty() => {
+                return no_store_json(
+                    StatusCode::OK,
+                    &LogFacetsResponse {
+                        total_count: 0,
+                        services: Vec::new(),
+                        levels: Vec::new(),
+                        histogram: Vec::new(),
+                    },
+                );
+            }
+            Ok(opt) => opt,
+            Err(e) => {
+                return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            }
+        }
+    } else {
+        None
+    };
+
     let step_ms = params.step_ms.unwrap_or(60_000).clamp(1_000, 86_400_000);
     let step_ns = (step_ms as i64) * 1_000_000;
-    let from_ns = params.from.map(|f| f * 1_000_000).unwrap_or(0);
-    let to_ns = params.to.map(|t| t * 1_000_000).unwrap_or(i64::MAX);
+    let from_ns = params
+        .from
+        .map(|f| f.max(0).saturating_mul(1_000_000))
+        .unwrap_or(0);
+    let to_ns = params
+        .to
+        .map(|t| t.max(0).saturating_mul(1_000_000))
+        .unwrap_or(i64::MAX);
 
     let redactor = PrivacyRedactor::new();
+    let hashes_vec: Option<Vec<u64>> = candidate_hashes.map(|set| set.into_iter().collect());
 
-    let total_count: u64 = conn
-        .query_row(
+    // Query 1: total_count
+    let total_count: u64 = if let Some(ref hv) = hashes_vec {
+        let placeholders = (5..=4 + hv.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT COUNT(*)
+            FROM v_logs
+            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+              AND (?3 IS NULL OR service_name = ?3)
+              AND (?4 IS NULL OR job_id = ?4)
+              AND dedup_hash IN ({placeholders})
+            "#
+        );
+        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(4 + hv.len());
+        p.push(&from_ns);
+        p.push(&to_ns);
+        p.push(&params.service);
+        p.push(&params.job_id);
+        for h in hv {
+            p.push(h);
+        }
+        conn.query_row(&sql, &p[..], |r| r.get(0)).unwrap_or(0)
+    } else {
+        conn.query_row(
             r#"
             SELECT COUNT(*)
             FROM v_logs
@@ -652,10 +939,50 @@ async fn handle_get_log_facets(
             params![from_ns, to_ns, params.service, params.job_id],
             |r| r.get(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(0)
+    };
 
+    // Query 2: services
     let mut services = Vec::new();
-    if let Ok(mut svc_stmt) = conn.prepare(
+    if let Some(ref hv) = hashes_vec {
+        let placeholders = (4..=3 + hv.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT service_name, COUNT(*) AS cnt
+            FROM v_logs
+            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+              AND (?3 IS NULL OR job_id = ?3)
+              AND dedup_hash IN ({placeholders})
+            GROUP BY service_name
+            ORDER BY cnt DESC
+            LIMIT 50
+            "#
+        );
+        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(3 + hv.len());
+        p.push(&from_ns);
+        p.push(&to_ns);
+        p.push(&params.job_id);
+        for h in hv {
+            p.push(h);
+        }
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(&p[..], |r| {
+                let raw_svc: String = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                Ok(FacetCount {
+                    name: redactor.redact_str(&raw_svc),
+                    count: count.max(0) as u64,
+                })
+            }) {
+                for r in rows.flatten() {
+                    services.push(r);
+                }
+            }
+        }
+    } else if let Ok(mut svc_stmt) = conn.prepare(
         r#"
         SELECT service_name, COUNT(*) AS cnt
         FROM v_logs
@@ -680,8 +1007,48 @@ async fn handle_get_log_facets(
         }
     }
 
+    // Query 3: levels
     let mut levels = Vec::new();
-    if let Ok(mut lvl_stmt) = conn.prepare(
+    if let Some(ref hv) = hashes_vec {
+        let placeholders = (5..=4 + hv.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt
+            FROM v_logs
+            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+              AND (?3 IS NULL OR service_name = ?3)
+              AND (?4 IS NULL OR job_id = ?4)
+              AND dedup_hash IN ({placeholders})
+            GROUP BY lvl
+            ORDER BY cnt DESC
+            "#
+        );
+        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(4 + hv.len());
+        p.push(&from_ns);
+        p.push(&to_ns);
+        p.push(&params.service);
+        p.push(&params.job_id);
+        for h in hv {
+            p.push(h);
+        }
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(&p[..], |r| {
+                let lvl: String = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                Ok(FacetCount {
+                    name: lvl,
+                    count: count.max(0) as u64,
+                })
+            }) {
+                for r in rows.flatten() {
+                    levels.push(r);
+                }
+            }
+        }
+    } else if let Ok(mut lvl_stmt) = conn.prepare(
         r#"
         SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt
         FROM v_logs
@@ -709,8 +1076,63 @@ async fn handle_get_log_facets(
         }
     }
 
+    // Query 4: histogram
+    let step_ms_i64 = step_ms as i64;
     let mut histogram = Vec::new();
-    if let Ok(mut hist_stmt) = conn.prepare(
+    if let Some(ref hv) = hashes_vec {
+        let placeholders = (7..=6 + hv.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT
+                (timestamp_unix_nano / ?1) * ?2 AS bucket_ts,
+                COUNT(*) AS total_cnt,
+                SUM(CASE WHEN severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL') THEN 1 ELSE 0 END) AS err_cnt,
+                SUM(CASE WHEN (severity_number >= 13 AND severity_number < 17) OR UPPER(severity_text) IN ('WARN', 'WARNING') THEN 1 ELSE 0 END) AS warn_cnt,
+                SUM(CASE WHEN severity_number < 13 OR UPPER(severity_text) IN ('INFO', 'DEBUG', 'TRACE') THEN 1 ELSE 0 END) AS info_cnt
+            FROM v_logs
+            WHERE timestamp_unix_nano >= ?3 AND timestamp_unix_nano <= ?4
+              AND (?5 IS NULL OR service_name = ?5)
+              AND (?6 IS NULL OR job_id = ?6)
+              AND dedup_hash IN ({placeholders})
+            GROUP BY bucket_ts
+            ORDER BY bucket_ts ASC
+            LIMIT 500
+            "#
+        );
+        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(6 + hv.len());
+        p.push(&step_ns);
+        p.push(&step_ms_i64);
+        p.push(&from_ns);
+        p.push(&to_ns);
+        p.push(&params.service);
+        p.push(&params.job_id);
+        for h in hv {
+            p.push(h);
+        }
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(&p[..], |r| {
+                let b_ts: i64 = r.get(0)?;
+                let total: i64 = r.get(1)?;
+                let errs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                let warns: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                let infos: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                Ok(LogHistogramBucket {
+                    bucket_ts_ms: b_ts.max(0) as u64,
+                    count: total.max(0) as u64,
+                    error_count: errs.max(0) as u64,
+                    warn_count: warns.max(0) as u64,
+                    info_count: infos.max(0) as u64,
+                })
+            }) {
+                for r in rows.flatten() {
+                    histogram.push(r);
+                }
+            }
+        }
+    } else if let Ok(mut hist_stmt) = conn.prepare(
         r#"
         SELECT
             (timestamp_unix_nano / ?1) * ?2 AS bucket_ts,
@@ -907,7 +1329,10 @@ async fn handle_get_logs(
         None => 50,
     };
 
-    match query_sanitized_logs_with_token(
+    let from_ns = params.from.map(|f| f.max(0).saturating_mul(1_000_000));
+    let to_ns = params.to.map(|t| t.max(0).saturating_mul(1_000_000));
+
+    match query_sanitized_logs_with_token_and_bounds(
         &store,
         &sev_norm,
         min_sev_range,
@@ -915,6 +1340,8 @@ async fn handle_get_logs(
         params.trace_id.as_deref(),
         params.job_id.as_deref(),
         token_query,
+        from_ns,
+        to_ns,
         limit,
     ) {
         Ok(resp) => no_store_json(StatusCode::OK, &resp),
@@ -1006,6 +1433,33 @@ pub fn query_sanitized_logs_with_token(
     token_query: Option<&str>,
     limit: usize,
 ) -> Result<LogsQueryResponse, MuObserveError> {
+    query_sanitized_logs_with_token_and_bounds(
+        store,
+        severity_label,
+        sev_range,
+        service_filter,
+        trace_id_filter,
+        job_id_filter,
+        token_query,
+        None,
+        None,
+        limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn query_sanitized_logs_with_token_and_bounds(
+    store: &HotDuckDbStore,
+    severity_label: &str,
+    sev_range: Option<(i32, i32, &str)>,
+    service_filter: Option<&str>,
+    trace_id_filter: Option<&str>,
+    job_id_filter: Option<&str>,
+    token_query: Option<&str>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    limit: usize,
+) -> Result<LogsQueryResponse, MuObserveError> {
     let redactor = PrivacyRedactor::new();
     let max_cap = if job_id_filter.is_some() { 500 } else { 100 };
     let bounded_limit = limit.clamp(1, max_cap);
@@ -1022,6 +1476,10 @@ pub fn query_sanitized_logs_with_token(
                     && trace_id_filter
                         .map(|tid| item.trace_id == tid)
                         .unwrap_or(true)
+                    && from_ns
+                        .map(|f| item.timestamp_unix_nano >= f)
+                        .unwrap_or(true)
+                    && to_ns.map(|t| item.timestamp_unix_nano <= t).unwrap_or(true)
             })
             .take(bounded_limit)
             .collect()
@@ -1033,6 +1491,8 @@ pub fn query_sanitized_logs_with_token(
             service_filter,
             trace_id_filter,
             job_id_filter,
+            from_ns,
+            to_ns,
             bounded_limit,
         )?
     };
@@ -1055,6 +1515,7 @@ pub fn query_sanitized_logs_with_token(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_v_logs_rows(
     store: &HotDuckDbStore,
     redactor: &PrivacyRedactor,
@@ -1062,9 +1523,16 @@ fn query_v_logs_rows(
     service_filter: Option<&str>,
     trace_id_filter: Option<&str>,
     job_id_filter: Option<&str>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
     bounded_limit: usize,
 ) -> Result<Vec<ConsoleLogItem>, MuObserveError> {
     let conn = store.lock_conn()?;
+    let (min_sev, max_sev, sev_text) = match sev_range {
+        Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
+        None => (None, None, None),
+    };
+
     let mut stmt = conn.prepare(
         r#"
         SELECT
@@ -1074,38 +1542,54 @@ fn query_v_logs_rows(
         FROM v_logs
         WHERE (?1 IS NULL OR trace_id = ?1)
           AND (?2 IS NULL OR job_id = ?2)
+          AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL'))
+          AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
+          AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
+          AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
         ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
         LIMIT 500
         "#,
     )?;
 
-    let rows = stmt.query_map(params![trace_id_filter, job_id_filter], |r| {
-        let ts_ns: i64 = r.get(0)?;
-        let raw_svc: String = r.get(5)?;
-        let raw_node: String = r.get(6)?;
-        let raw_body: String = r.get(7)?;
-        let raw_attrs: String = r.get(8)?;
-        let line_no_u32: u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
-        let stream_u8: u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
-        let clean_svc = redactor.redact_str(&raw_svc);
-        Ok(ConsoleLogItem {
-            timestamp_unix_nano: ts_ns,
-            timestamp_ms: ts_ns / 1_000_000,
-            trace_id: r.get(1)?,
-            span_id: r.get(2)?,
-            severity_number: r.get(3)?,
-            severity_text: r.get(4)?,
-            service: clean_svc.clone(),
-            service_name: clean_svc,
-            node_id: redactor.redact_host(&raw_node),
-            body: redactor.redact_str(&raw_body),
-            attributes: redactor.redact_attributes_json(&raw_attrs),
-            job_id: r.get(9)?,
-            stage_id: r.get(10)?,
-            line_no: line_no_u32,
-            stream: stream_u8,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![
+            trace_id_filter,
+            job_id_filter,
+            min_sev,
+            max_sev,
+            sev_text,
+            service_filter,
+            from_ns,
+            to_ns,
+        ],
+        |r| {
+            let ts_ns: i64 = r.get(0)?;
+            let raw_svc: String = r.get(5)?;
+            let raw_node: String = r.get(6)?;
+            let raw_body: String = r.get(7)?;
+            let raw_attrs: String = r.get(8)?;
+            let line_no_u32: u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
+            let stream_u8: u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
+            let clean_svc = redactor.redact_str(&raw_svc);
+            Ok(ConsoleLogItem {
+                timestamp_unix_nano: ts_ns,
+                timestamp_ms: ts_ns / 1_000_000,
+                trace_id: r.get(1)?,
+                span_id: r.get(2)?,
+                severity_number: r.get(3)?,
+                severity_text: r.get(4)?,
+                service: clean_svc.clone(),
+                service_name: clean_svc,
+                node_id: redactor.redact_host(&raw_node),
+                body: redactor.redact_str(&raw_body),
+                attributes: redactor.redact_attributes_json(&raw_attrs),
+                job_id: r.get(9)?,
+                stage_id: r.get(10)?,
+                line_no: line_no_u32,
+                stream: stream_u8,
+            })
+        },
+    )?;
 
     let mut logs = Vec::new();
     for r in rows {
