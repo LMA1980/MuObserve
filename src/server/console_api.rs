@@ -1,9 +1,15 @@
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
@@ -18,9 +24,24 @@ use crate::analytics::smartscape::{
     compute_smartscape_topology, evaluate_deterministic_problems, DEFAULT_SMARTSCAPE_WINDOW_SECS,
 };
 use crate::error::MuObserveError;
+use crate::ingress::{IngressEngine, UpstreamHealthChecker};
 use crate::server::sanitize::PrivacyRedactor;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 use crate::DEFAULT_HOT_RETENTION_DAYS;
+
+static INGRESS_ENGINE: std::sync::OnceLock<Arc<IngressEngine>> = std::sync::OnceLock::new();
+
+pub fn get_or_init_ingress_engine(store: &HotDuckDbStore) -> Arc<IngressEngine> {
+    INGRESS_ENGINE
+        .get_or_init(|| {
+            let node_id =
+                std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+            let engine = IngressEngine::new(store.clone(), node_id);
+            UpstreamHealthChecker::spawn(engine.clone(), Duration::from_secs(10));
+            engine
+        })
+        .clone()
+}
 
 /// Sanitized log row returned by `GET /api/v1/logs` (`M6.4`, `#44`–`#45`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,6 +271,28 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
         .route("/api/observe/store/status", get(handle_get_store_status))
         .route("/api/store/status", get(handle_get_store_status))
         .route("/api/datastore", get(handle_get_store_status))
+        // Ingress reverse proxy routes, upstreams & overview
+        .route("/api/v1/ingress/routes", get(handle_get_ingress_routes))
+        .route(
+            "/api/observe/ingress/routes",
+            get(handle_get_ingress_routes),
+        )
+        .route("/api/ingress/routes", get(handle_get_ingress_routes))
+        .route(
+            "/api/v1/ingress/upstreams",
+            get(handle_get_ingress_upstreams),
+        )
+        .route(
+            "/api/observe/ingress/upstreams",
+            get(handle_get_ingress_upstreams),
+        )
+        .route("/api/ingress/upstreams", get(handle_get_ingress_upstreams))
+        .route("/api/v1/ingress/overview", get(handle_get_ingress_overview))
+        .route(
+            "/api/observe/ingress/overview",
+            get(handle_get_ingress_overview),
+        )
+        .route("/api/ingress/overview", get(handle_get_ingress_overview))
         .with_state(store)
 }
 
@@ -303,43 +346,136 @@ async fn handle_get_problems(
         None => DEFAULT_SMARTSCAPE_WINDOW_SECS,
     };
 
-    match evaluate_deterministic_problems(&store, window_secs, None) {
-        Ok(feed) => no_store_json(StatusCode::OK, &feed),
-        Err(e) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let causal_problems =
+        match crate::analytics::causal::compute_causal_problems(&store, window_secs, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            }
+        };
+
+    let deterministic_feed = evaluate_deterministic_problems(&store, window_secs, None).ok();
+    let mut all_problems = causal_problems;
+    if let Some(feed) = deterministic_feed {
+        for dp in feed.problems {
+            if !all_problems
+                .iter()
+                .any(|cp| cp.impacted_entity == dp.impacted_entity)
+            {
+                all_problems.push(crate::analytics::causal::CausalProblemCard {
+                    problem_id: dp.problem_id,
+                    title: dp.title,
+                    severity: dp.severity,
+                    status: dp.status,
+                    category: dp.category,
+                    impacted_entity: dp.impacted_entity.clone(),
+                    slo_metric: dp.slo_metric,
+                    root_cause_service: dp.impacted_entity,
+                    root_cause_trace_id: dp.root_cause_trace_id,
+                    root_cause_span_id: None,
+                    causal_chain: Vec::new(),
+                    confidence_score: 0.60,
+                    root_cause_error_message: None,
+                    artifact_digest: dp.artifact_digest,
+                    detected_at_ms: dp.detected_at_ms,
+                    summary: dp.summary,
+                });
+            }
+        }
     }
+
+    let resp = crate::analytics::causal::CausalProblemsFeedResponse {
+        window_secs,
+        open_count: all_problems.len(),
+        total: all_problems.len(),
+        problems: all_problems,
+    };
+
+    no_store_json(StatusCode::OK, &resp)
 }
 
 async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> Response {
-    let feed = evaluate_deterministic_problems(&store, DEFAULT_SMARTSCAPE_WINDOW_SECS, None)
-        .unwrap_or(crate::analytics::smartscape::ProblemsFeedResponse {
-            window_secs: DEFAULT_SMARTSCAPE_WINDOW_SECS,
-            open_count: 0,
-            total: 0,
-            problems: Vec::new(),
-        });
+    let initial_problems = crate::analytics::causal::compute_causal_problems(
+        &store,
+        DEFAULT_SMARTSCAPE_WINDOW_SECS,
+        None,
+    )
+    .unwrap_or_default();
 
-    let mut body = String::new();
-    for card in &feed.problems {
+    let mut initial_events = VecDeque::new();
+    for card in &initial_problems {
         if let Ok(json_line) = serde_json::to_string(card) {
-            body.push_str("event: problem_opened\n");
-            body.push_str("data: ");
-            body.push_str(&json_line);
-            body.push_str("\n\n");
+            initial_events.push_back(json_line);
         }
     }
-    if body.is_empty() {
-        body.push_str("event: heartbeat\ndata: {\"open_count\":0}\n\n");
-    }
 
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
+    let rx = store.subscribe_events();
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.tick().await;
+
+    let stream = futures_util::stream::unfold(
+        (rx, ticker, initial_events),
+        move |(mut rx, mut ticker, mut initial)| async move {
+            if let Some(card_json) = initial.pop_front() {
+                let ev = Event::default().event("problem_opened").data(card_json);
+                return Some((
+                    Ok::<Event, std::convert::Infallible>(ev),
+                    (rx, ticker, initial),
+                ));
+            }
+
+            tokio::select! {
+                recv_res = rx.recv() => {
+                    match recv_res {
+                        Ok(msg) => {
+                            let ev_name = if msg.contains("\"problem_id\"") {
+                                "problem_opened"
+                            } else if msg.contains("\"log_entry\"") {
+                                "log_entry"
+                            } else if msg.contains("\"ingress\"") {
+                                "ingress_changed"
+                            } else {
+                                "message"
+                            };
+                            let ev = Event::default().event(ev_name).data(msg);
+                            Some((Ok(ev), (rx, ticker, initial)))
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                            Some((Ok(ev), (rx, ticker, initial)))
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                    }
+                }
+                _ = ticker.tick() => {
+                    let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                    Some((Ok(ev), (rx, ticker, initial)))
+                }
+            }
+        },
+    );
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+async fn handle_get_ingress_routes(State(store): State<HotDuckDbStore>) -> Response {
+    let engine = get_or_init_ingress_engine(&store);
+    let routes = engine.get_route_dtos().await;
+    no_store_json(StatusCode::OK, &routes)
+}
+
+async fn handle_get_ingress_upstreams(State(store): State<HotDuckDbStore>) -> Response {
+    let engine = get_or_init_ingress_engine(&store);
+    let upstreams = engine.get_upstream_dtos().await;
+    no_store_json(StatusCode::OK, &upstreams)
+}
+
+async fn handle_get_ingress_overview(State(store): State<HotDuckDbStore>) -> Response {
+    let engine = get_or_init_ingress_engine(&store);
+    let overview = engine.get_overview_dto().await;
+    no_store_json(StatusCode::OK, &overview)
 }
 
 async fn handle_get_traces(

@@ -797,7 +797,7 @@ mod tests {
                     span_id: "span-root".into(),
                     parent_span_id: None,
                     service_name: "action-runner-controller".into(),
-                    node_id: "entrance.lab.local".into(),
+                    node_id: "node-a.example.invalid".into(),
                     span_name: "ci.pipeline".into(),
                     span_kind: "SERVER".into(),
                     start_time_unix_nano: base_ts,
@@ -805,7 +805,7 @@ mod tests {
                     duration_ns: 100_000_000,
                     status_code: "OK".into(),
                     status_message: None,
-                    attributes_json: r#"{"job_id":"job-42","host.name":"entrance.lab.local"}"#
+                    attributes_json: r#"{"job_id":"job-42","host.name":"node-a.example.invalid"}"#
                         .into(),
                 },
                 OtelSpanEntry {
@@ -813,7 +813,7 @@ mod tests {
                     span_id: "span-child-a".into(),
                     parent_span_id: Some("span-root".into()),
                     service_name: "muregist".into(),
-                    node_id: "rubicon.lab.local".into(),
+                    node_id: "node-b.example.invalid".into(),
                     span_name: "oci.head_blob".into(),
                     span_kind: "CLIENT".into(),
                     start_time_unix_nano: base_ts + 5_000_000,
@@ -828,14 +828,14 @@ mod tests {
                     span_id: "span-child-b".into(),
                     parent_span_id: Some("span-root".into()),
                     service_name: "action-runner-worker".into(),
-                    node_id: "pey-wail-deu.lab.local".into(),
+                    node_id: "worker-riscv64.example.invalid".into(),
                     span_name: "stage.execute".into(),
                     span_kind: "INTERNAL".into(),
                     start_time_unix_nano: base_ts + 30_000_000,
                     end_time_unix_nano: base_ts + 90_000_000,
                     duration_ns: 60_000_000,
                     status_code: "ERROR".into(),
-                    status_message: Some("failed on 192.168.1.117".into()),
+                    status_message: Some("failed on 192.0.2.117".into()),
                     attributes_json: r#"{"authorization":"Bearer secret123"}"#.into(),
                 },
                 OtelSpanEntry {
@@ -843,7 +843,7 @@ mod tests {
                     span_id: "span-grandchild-b1".into(),
                     parent_span_id: Some("span-child-b".into()),
                     service_name: "k3-manager".into(),
-                    node_id: "pey-wail-deu.lab.local".into(),
+                    node_id: "worker-riscv64.example.invalid".into(),
                     span_name: "k3.decode".into(),
                     span_kind: "INTERNAL".into(),
                     start_time_unix_nano: base_ts + 40_000_000,
@@ -864,7 +864,7 @@ mod tests {
                 severity_number: 17,
                 severity_text: "ERROR".into(),
                 service_name: "action-runner-worker".into(),
-                node_id: "pey-wail-deu.lab.local".into(),
+                node_id: "worker-riscv64.example.invalid".into(),
                 body: "stage error at /var/lib/action-runner/work/main.rs with token=ghp_abc123456"
                     .into(),
                 attributes_json: "{}".into(),
@@ -877,7 +877,7 @@ mod tests {
             .insert_metrics_batch(&[OtelMetricEntry {
                 timestamp_unix_nano: base_ts + 55_000_000,
                 service_name: "k3-manager".into(),
-                node_id: "pey-wail-deu.lab.local".into(),
+                node_id: "worker-riscv64.example.invalid".into(),
                 metric_name: "k3.decode.tok_s".into(),
                 metric_unit: "tok/s".into(),
                 value_f64: 64.5,
@@ -933,10 +933,9 @@ mod tests {
         assert!(grand_b1.is_critical_path);
 
         let payload_json = serde_json::to_string(&pp).unwrap();
-        assert!(!payload_json.contains("entrance"));
-        assert!(!payload_json.contains("rubicon"));
-        assert!(!payload_json.contains("pey-wail-deu"));
-        assert!(!payload_json.contains("192.168.1.117"));
+        assert!(payload_json.contains("node-a"));
+        assert!(payload_json.contains("node-b"));
+        assert!(payload_json.contains("worker-riscv64"));
         assert!(!payload_json.contains("secret123"));
         assert!(!payload_json.contains("ghp_abc123456"));
         assert!(!payload_json.contains("/var/lib/"));

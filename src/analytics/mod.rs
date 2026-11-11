@@ -1,8 +1,10 @@
+pub mod causal;
 pub mod purepath;
 pub mod regression;
 pub mod slo;
 pub mod smartscape;
 
+pub use causal::{compute_causal_problems, CausalProblemCard, CausalProblemsFeedResponse};
 pub use purepath::{
     compute_purepath_waterfall, list_trace_summaries, PurePathLogEntry, PurePathMetricEntry,
     PurePathResponse, PurePathSpanNode, TraceListFilter, TraceListQuery, TraceListResponse,
