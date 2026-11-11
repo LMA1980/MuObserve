@@ -383,7 +383,34 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
     assert_eq!(ov_status, StatusCode::OK);
     assert_eq!(ov_cc, "no-store");
     assert_eq!(overview_val["routes"].as_array().unwrap().len(), 5);
-    assert!(overview_val["tls_health"]["domain"].is_string());
+    assert!(overview_val["tls_health"].is_null());
+
+    // Dynamically update TLS health via POST /api/v1/ingress/tls
+    let tls_payload = serde_json::json!({
+        "domain": "console.k3.internal",
+        "certificate_issuer": "step-ca intermediate",
+        "valid_until_epoch_ms": 1_705_000_000_000i64,
+        "days_remaining": 58,
+        "alpn_protocols": ["h2", "http/1.1"],
+        "ocsp_stapling": true,
+        "mutual_tls": true
+    });
+    let post_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingress/tls")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&tls_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::OK);
+
+    let (_, _, overview_updated) = get_json(&app, "/api/v1/ingress/overview").await;
+    assert!(overview_updated["tls_health"]["domain"].is_string());
 }
 
 async fn get_text(router: &axum::Router, uri: &str) -> (StatusCode, String, String) {

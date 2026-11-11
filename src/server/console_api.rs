@@ -10,7 +10,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use duckdb::params;
@@ -29,18 +29,22 @@ use crate::server::sanitize::PrivacyRedactor;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 use crate::DEFAULT_HOT_RETENTION_DAYS;
 
-static INGRESS_ENGINE: std::sync::OnceLock<Arc<IngressEngine>> = std::sync::OnceLock::new();
+#[derive(Clone)]
+pub struct ConsoleApiState {
+    pub store: HotDuckDbStore,
+    pub ingress: Arc<IngressEngine>,
+}
 
-pub fn get_or_init_ingress_engine(store: &HotDuckDbStore) -> Arc<IngressEngine> {
-    INGRESS_ENGINE
-        .get_or_init(|| {
-            let node_id =
-                std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
-            let engine = IngressEngine::new(store.clone(), node_id);
-            UpstreamHealthChecker::spawn(engine.clone(), Duration::from_secs(10));
-            engine
-        })
-        .clone()
+impl axum::extract::FromRef<ConsoleApiState> for HotDuckDbStore {
+    fn from_ref(state: &ConsoleApiState) -> Self {
+        state.store.clone()
+    }
+}
+
+impl axum::extract::FromRef<ConsoleApiState> for Arc<IngressEngine> {
+    fn from_ref(state: &ConsoleApiState) -> Self {
+        state.ingress.clone()
+    }
 }
 
 /// Sanitized log row returned by `GET /api/v1/logs` (`M6.4`, `#44`–`#45`).
@@ -189,6 +193,17 @@ struct MetricsQueryParams {
 /// Builds the read-only observability Axum [`Router`] mounting `/api/v1/*`, `/api/v1/console/*`,
 /// `/api/observe/*`, and `/api/*` endpoints with `Cache-Control: no-store`.
 pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
+    let node_id = std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+    let ingress = IngressEngine::new(store.clone(), node_id);
+    UpstreamHealthChecker::spawn(ingress.clone(), Duration::from_secs(10));
+    build_console_api_router_with_ingress(store, ingress)
+}
+
+pub fn build_console_api_router_with_ingress(
+    store: HotDuckDbStore,
+    ingress: Arc<IngressEngine>,
+) -> Router {
+    let state = ConsoleApiState { store, ingress };
     Router::new()
         // Smartscape topology
         .route("/api/v1/smartscape", get(handle_get_smartscape))
@@ -271,13 +286,22 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
         .route("/api/observe/store/status", get(handle_get_store_status))
         .route("/api/store/status", get(handle_get_store_status))
         .route("/api/datastore", get(handle_get_store_status))
-        // Ingress reverse proxy routes, upstreams & overview
-        .route("/api/v1/ingress/routes", get(handle_get_ingress_routes))
+        // Ingress reverse proxy routes, upstreams, overview & dynamic configuration
+        .route(
+            "/api/v1/ingress/routes",
+            get(handle_get_ingress_routes).post(handle_post_ingress_route),
+        )
         .route(
             "/api/observe/ingress/routes",
-            get(handle_get_ingress_routes),
+            get(handle_get_ingress_routes).post(handle_post_ingress_route),
         )
-        .route("/api/ingress/routes", get(handle_get_ingress_routes))
+        .route(
+            "/api/ingress/routes",
+            get(handle_get_ingress_routes).post(handle_post_ingress_route),
+        )
+        .route("/api/v1/ingress/tls", post(handle_post_ingress_tls))
+        .route("/api/observe/ingress/tls", post(handle_post_ingress_tls))
+        .route("/api/ingress/tls", post(handle_post_ingress_tls))
         .route(
             "/api/v1/ingress/upstreams",
             get(handle_get_ingress_upstreams),
@@ -293,7 +317,15 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
             get(handle_get_ingress_overview),
         )
         .route("/api/ingress/overview", get(handle_get_ingress_overview))
-        .with_state(store)
+        // Log aggregations / facets / histograms
+        .route("/api/v1/logs/facets", get(handle_get_log_facets))
+        .route("/api/obs/v1/logs/facets", get(handle_get_log_facets))
+        .route("/api/observe/logs/facets", get(handle_get_log_facets))
+        .route("/api/logs/facets", get(handle_get_log_facets))
+        .route("/api/v1/logs/aggregations", get(handle_get_log_facets))
+        .route("/api/obs/v1/logs/aggregations", get(handle_get_log_facets))
+        .fallback(handle_ingress_fallback)
+        .with_state(state)
 }
 
 async fn handle_get_smartscape(
@@ -370,7 +402,7 @@ async fn handle_get_problems(
                     category: dp.category,
                     impacted_entity: dp.impacted_entity.clone(),
                     slo_metric: dp.slo_metric,
-                    root_cause_service: dp.impacted_entity,
+                    root_cause_service: dp.impacted_entity.clone(),
                     root_cause_trace_id: dp.root_cause_trace_id,
                     root_cause_span_id: None,
                     causal_chain: Vec::new(),
@@ -379,6 +411,9 @@ async fn handle_get_problems(
                     artifact_digest: dp.artifact_digest,
                     detected_at_ms: dp.detected_at_ms,
                     summary: dp.summary,
+                    burn_rate_bp: 100,
+                    affected_services: vec![dp.impacted_entity],
+                    ai_diagnosis: None,
                 });
             }
         }
@@ -460,22 +495,269 @@ async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> R
         .into_response()
 }
 
-async fn handle_get_ingress_routes(State(store): State<HotDuckDbStore>) -> Response {
-    let engine = get_or_init_ingress_engine(&store);
+async fn handle_get_ingress_routes(State(engine): State<Arc<IngressEngine>>) -> Response {
     let routes = engine.get_route_dtos().await;
     no_store_json(StatusCode::OK, &routes)
 }
 
-async fn handle_get_ingress_upstreams(State(store): State<HotDuckDbStore>) -> Response {
-    let engine = get_or_init_ingress_engine(&store);
+async fn handle_get_ingress_upstreams(State(engine): State<Arc<IngressEngine>>) -> Response {
     let upstreams = engine.get_upstream_dtos().await;
     no_store_json(StatusCode::OK, &upstreams)
 }
 
-async fn handle_get_ingress_overview(State(store): State<HotDuckDbStore>) -> Response {
-    let engine = get_or_init_ingress_engine(&store);
+async fn handle_get_ingress_overview(State(engine): State<Arc<IngressEngine>>) -> Response {
     let overview = engine.get_overview_dto().await;
     no_store_json(StatusCode::OK, &overview)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngressRouteCreateRequest {
+    pub route_id: String,
+    pub path_prefix: String,
+    pub upstream_url: String,
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub strip_prefix: bool,
+    #[serde(default)]
+    pub auth_required: bool,
+}
+
+async fn handle_post_ingress_route(
+    State(engine): State<Arc<IngressEngine>>,
+    Json(payload): Json<IngressRouteCreateRequest>,
+) -> Response {
+    engine.add_route(
+        &payload.route_id,
+        &payload.path_prefix,
+        &payload.upstream_url,
+        &payload.service_name,
+        payload.strip_prefix,
+        payload.auth_required,
+    );
+    no_store_json(
+        StatusCode::CREATED,
+        &json!({
+            "status": "created",
+            "route_id": payload.route_id
+        }),
+    )
+}
+
+async fn handle_post_ingress_tls(
+    State(engine): State<Arc<IngressEngine>>,
+    Json(payload): Json<crate::ingress::TlsHealthDto>,
+) -> Response {
+    engine.set_tls_health(payload).await;
+    no_store_json(
+        StatusCode::OK,
+        &json!({
+            "status": "updated"
+        }),
+    )
+}
+
+async fn handle_ingress_fallback(
+    State(engine): State<Arc<IngressEngine>>,
+    req: axum::extract::Request,
+) -> Response {
+    match engine.proxy_request(req).await {
+        Ok(resp) => resp,
+        Err(e) => axum::response::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(axum::body::Body::from(format!("Ingress Proxy Error: {e}")))
+            .unwrap_or_default(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogFacetsParams {
+    pub q: Option<String>,
+    pub token: Option<String>,
+    pub service: Option<String>,
+    pub job_id: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub step_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFacetsResponse {
+    pub total_count: u64,
+    pub services: Vec<FacetCount>,
+    pub levels: Vec<FacetCount>,
+    pub histogram: Vec<LogHistogramBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacetCount {
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogHistogramBucket {
+    pub bucket_ts_ms: u64,
+    pub count: u64,
+    pub error_count: u64,
+    pub warn_count: u64,
+    pub info_count: u64,
+}
+
+async fn handle_get_log_facets(
+    State(store): State<HotDuckDbStore>,
+    q_res: Result<Query<LogFacetsParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match q_res {
+        Ok(q) => q,
+        Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    if let Some(ref t) = params.token {
+        for part in t.split_whitespace() {
+            if let Err(e) = validate_safe_filter_token(part) {
+                return json_error_response(StatusCode::BAD_REQUEST, e);
+            }
+        }
+    }
+    if let Some(ref q) = params.q {
+        for part in q.split_whitespace() {
+            if let Err(e) = validate_safe_filter_token(part) {
+                return json_error_response(StatusCode::BAD_REQUEST, e);
+            }
+        }
+    }
+
+    let conn = match store.lock_conn() {
+        Ok(c) => c,
+        Err(e) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let step_ms = params.step_ms.unwrap_or(60_000).clamp(1_000, 86_400_000);
+    let step_ns = (step_ms as i64) * 1_000_000;
+    let from_ns = params.from.map(|f| f * 1_000_000).unwrap_or(0);
+    let to_ns = params.to.map(|t| t * 1_000_000).unwrap_or(i64::MAX);
+
+    let redactor = PrivacyRedactor::new();
+
+    let total_count: u64 = conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM v_logs
+            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+              AND (?3 IS NULL OR service_name = ?3)
+              AND (?4 IS NULL OR job_id = ?4)
+            "#,
+            params![from_ns, to_ns, params.service, params.job_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let mut services = Vec::new();
+    if let Ok(mut svc_stmt) = conn.prepare(
+        r#"
+        SELECT service_name, COUNT(*) AS cnt
+        FROM v_logs
+        WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+          AND (?3 IS NULL OR job_id = ?3)
+        GROUP BY service_name
+        ORDER BY cnt DESC
+        LIMIT 50
+        "#,
+    ) {
+        if let Ok(rows) = svc_stmt.query_map(params![from_ns, to_ns, params.job_id], |r| {
+            let raw_svc: String = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok(FacetCount {
+                name: redactor.redact_str(&raw_svc),
+                count: count.max(0) as u64,
+            })
+        }) {
+            for r in rows.flatten() {
+                services.push(r);
+            }
+        }
+    }
+
+    let mut levels = Vec::new();
+    if let Ok(mut lvl_stmt) = conn.prepare(
+        r#"
+        SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt
+        FROM v_logs
+        WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+          AND (?3 IS NULL OR service_name = ?3)
+          AND (?4 IS NULL OR job_id = ?4)
+        GROUP BY lvl
+        ORDER BY cnt DESC
+        "#,
+    ) {
+        if let Ok(rows) = lvl_stmt.query_map(
+            params![from_ns, to_ns, params.service, params.job_id],
+            |r| {
+                let lvl: String = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                Ok(FacetCount {
+                    name: lvl,
+                    count: count.max(0) as u64,
+                })
+            },
+        ) {
+            for r in rows.flatten() {
+                levels.push(r);
+            }
+        }
+    }
+
+    let mut histogram = Vec::new();
+    if let Ok(mut hist_stmt) = conn.prepare(
+        r#"
+        SELECT
+            (timestamp_unix_nano / ?1) * ?2 AS bucket_ts,
+            COUNT(*) AS total_cnt,
+            SUM(CASE WHEN severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL') THEN 1 ELSE 0 END) AS err_cnt,
+            SUM(CASE WHEN (severity_number >= 13 AND severity_number < 17) OR UPPER(severity_text) IN ('WARN', 'WARNING') THEN 1 ELSE 0 END) AS warn_cnt,
+            SUM(CASE WHEN severity_number < 13 OR UPPER(severity_text) IN ('INFO', 'DEBUG', 'TRACE') THEN 1 ELSE 0 END) AS info_cnt
+        FROM v_logs
+        WHERE timestamp_unix_nano >= ?3 AND timestamp_unix_nano <= ?4
+          AND (?5 IS NULL OR service_name = ?5)
+          AND (?6 IS NULL OR job_id = ?6)
+        GROUP BY bucket_ts
+        ORDER BY bucket_ts ASC
+        LIMIT 500
+        "#,
+    ) {
+        if let Ok(rows) = hist_stmt.query_map(
+            params![step_ns, step_ms as i64, from_ns, to_ns, params.service, params.job_id],
+            |r| {
+                let b_ts: i64 = r.get(0)?;
+                let total: i64 = r.get(1)?;
+                let errs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                let warns: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                let infos: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                Ok(LogHistogramBucket {
+                    bucket_ts_ms: b_ts.max(0) as u64,
+                    count: total.max(0) as u64,
+                    error_count: errs.max(0) as u64,
+                    warn_count: warns.max(0) as u64,
+                    info_count: infos.max(0) as u64,
+                })
+            },
+        ) {
+            for r in rows.flatten() {
+                histogram.push(r);
+            }
+        }
+    }
+
+    let resp = LogFacetsResponse {
+        total_count,
+        services,
+        levels,
+        histogram,
+    };
+
+    no_store_json(StatusCode::OK, &resp)
 }
 
 async fn handle_get_traces(
@@ -1161,19 +1443,52 @@ fn scan_parquet_stats(root: &Path) -> (u64, u64) {
 }
 
 fn validate_safe_filter_token(input: &str) -> Result<(), &'static str> {
+    if input.bytes().any(|b| b < 32 || b == 127) {
+        return Err("Control characters are forbidden in filter parameters");
+    }
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("Filter parameter cannot be empty");
     }
-    if trimmed.len() > 128 {
-        return Err("Filter parameter exceeds maximum length (128)");
+    if trimmed.len() > 256 {
+        return Err("Filter parameter exceeds maximum length (256)");
     }
-    if trimmed.contains("--") || trimmed.contains("/*") || trimmed.contains("*/") {
-        return Err("SQL comment tokens are forbidden in filter parameters");
+    if trimmed.contains("--")
+        || trimmed.contains("/*")
+        || trimmed.contains("*/")
+        || trimmed.contains(';')
+    {
+        return Err("SQL comment and delimiter tokens are forbidden in filter parameters");
     }
     for b in trimmed.bytes() {
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/')) {
-            return Err("Filter parameter contains disallowed SQL/regex metacharacters");
+        if !(b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b':'
+                    | b'/'
+                    | b'"'
+                    | b'\''
+                    | b'*'
+                    | b'?'
+                    | b'='
+                    | b'<'
+                    | b'>'
+                    | b'+'
+                    | b'%'
+                    | b'@'
+                    | b'#'
+                    | b'~'
+                    | b'['
+                    | b']'
+                    | b'('
+                    | b')'
+                    | b'!'
+                    | b','
+            ))
+        {
+            return Err("Filter parameter contains disallowed SQL metacharacters");
         }
     }
     Ok(())
@@ -1195,4 +1510,136 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_safe_filter_token_comparison_operators() {
+        assert!(validate_safe_filter_token("rate>10").is_ok());
+        assert!(validate_safe_filter_token("duration<50").is_ok());
+        assert!(validate_safe_filter_token("latency_ms>=100").is_ok());
+        assert!(validate_safe_filter_token("count<=5").is_ok());
+        assert!(validate_safe_filter_token("status<>200").is_ok());
+        assert!(validate_safe_filter_token("burn_rate>1.5").is_ok());
+        assert!(validate_safe_filter_token("cpu<80%").is_ok());
+        assert!(validate_safe_filter_token("<tag>").is_ok());
+        assert!(validate_safe_filter_token(">100").is_ok());
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_valid_tokens() {
+        assert!(validate_safe_filter_token("service:checkout").is_ok());
+        assert!(validate_safe_filter_token("service:\"checkout\"").is_ok());
+        assert!(validate_safe_filter_token("error*").is_ok());
+        assert!(validate_safe_filter_token("test?").is_ok());
+        assert!(validate_safe_filter_token("[stage-1]").is_ok());
+        assert!(validate_safe_filter_token("(group-a)").is_ok());
+        assert!(validate_safe_filter_token("app:\"web\"").is_ok());
+        assert!(validate_safe_filter_token("tag#prod").is_ok());
+        assert!(validate_safe_filter_token("a+b").is_ok());
+        assert!(validate_safe_filter_token("fuzzy~2").is_ok());
+        assert!(validate_safe_filter_token("key=value").is_ok());
+        assert!(validate_safe_filter_token("val!error").is_ok());
+        assert!(validate_safe_filter_token("a,b,c").is_ok());
+        assert!(validate_safe_filter_token("@user").is_ok());
+        assert!(validate_safe_filter_token("job_123-abc.xyz/endpoint").is_ok());
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_sql_delimiters_and_comments() {
+        assert_eq!(
+            validate_safe_filter_token("rate>10; DROP TABLE v_logs;"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token(";"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10--comment"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("duration<50/*inline*/"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("*/dangling"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("<!--xml-->"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_control_characters() {
+        assert_eq!(
+            validate_safe_filter_token("rate>10\n"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\0"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\t"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\r"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\x7F"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_disallowed_metacharacters() {
+        assert_eq!(
+            validate_safe_filter_token("`rate`>10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10||1=1"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>\\10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("$rate>10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("{rate>10}"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_boundary_conditions() {
+        assert_eq!(
+            validate_safe_filter_token(""),
+            Err("Filter parameter cannot be empty")
+        );
+        assert_eq!(
+            validate_safe_filter_token("   "),
+            Err("Filter parameter cannot be empty")
+        );
+        let exact_256 = "a".repeat(256);
+        assert!(validate_safe_filter_token(&exact_256).is_ok());
+        let over_256 = "a".repeat(257);
+        assert_eq!(
+            validate_safe_filter_token(&over_256),
+            Err("Filter parameter exceeds maximum length (256)")
+        );
+    }
 }

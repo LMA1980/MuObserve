@@ -372,7 +372,7 @@ async fn test_end_to_end_mtls_stream_arrow_and_fory_pipeline() {
     let post_rpc: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(
         post_rpc.result.unwrap()["tools"].as_array().unwrap().len(),
-        10
+        12
     );
 
     // 4. Test CLI subcommands (traces, regressions, slo)

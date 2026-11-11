@@ -782,6 +782,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -794,6 +805,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -959,6 +971,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "want",
 ]
 
 [[package]]
@@ -1208,7 +1221,7 @@ dependencies = [
 [[package]]
 name = "mu-ci-isolation"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-ci-isolation.git?branch=feat%2Fm8-naming-alignment#98117ee3d6270c6ca9f290c2881515db65d7147b"
+source = "git+https://github.com/LMA1980/mu-ci-isolation.git?branch=main#0a7a5b16c724035ca4e94b9166afd7f51fb32555"
 dependencies = [
  "landlock",
  "libc",
@@ -1222,15 +1235,20 @@ dependencies = [
 
 [[package]]
 name = "mu-observable-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
+ "bytes",
  "chrono",
  "duckdb",
  "fory",
+ "futures-core",
+ "futures-util",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "mu-ci-isolation",
  "mu-observable-ipc",
@@ -1255,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=feat%2Fm8-naming-alignment#28793ce66732461cb68c3aef3006154939265abb"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=main#f6755f6aef6d00a6043fe0c842493477ab62aeb4"
 dependencies = [
  "arrow",
  "bytes",
@@ -2247,6 +2265,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2299,6 +2323,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "want"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b"
+dependencies = [
+ "try-lock",
+]
 
 [[package]]
 name = "wasi"

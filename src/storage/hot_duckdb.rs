@@ -795,6 +795,20 @@ impl HotDuckDbStore {
 
         if count > 0 {
             self.record_write_and_maybe_flush();
+            for item in expanded.iter().take(100) {
+                let ev = serde_json::json!({
+                    "log_entry": true,
+                    "timestamp_ms": (item.entry.timestamp_unix_nano / 1_000_000) as u64,
+                    "severity": item.entry.severity_text,
+                    "service": item.entry.service_name,
+                    "trace_id": item.entry.trace_id,
+                    "span_id": if item.entry.span_id.is_empty() { None } else { Some(&item.entry.span_id) },
+                    "message": item.entry.body,
+                });
+                if let Ok(payload) = serde_json::to_string(&ev) {
+                    self.broadcast_event(&payload);
+                }
+            }
         }
         Ok(count)
     }
@@ -858,7 +872,13 @@ impl HotDuckDbStore {
             return Ok(Vec::new());
         };
 
-        let mut stmt = conn.prepare(
+        let hash_csv = matched_hashes
+            .iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
             r#"
             SELECT
                 timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
@@ -866,11 +886,14 @@ impl HotDuckDbStore {
                 COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
             FROM v_logs
             WHERE (?1 IS NULL OR job_id = ?1)
+              AND dedup_hash IN ({hash_csv})
             ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
-            "#,
-        )?;
+            LIMIT ?2
+            "#
+        );
 
-        let rows = stmt.query_map(params![job_id], |r| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![job_id, bounded_limit as i64], |r| {
             let ts_ns: i64 = r.get(0)?;
             let raw_svc: String = r.get(5)?;
             let raw_node: String = r.get(6)?;
@@ -878,44 +901,30 @@ impl HotDuckDbStore {
             let raw_attrs: String = r.get(8)?;
             let line_no_u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
             let stream_u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
-            let dedup_hash: u64 = r.get(13)?;
             let clean_svc = redactor.redact_str(&raw_svc);
-            Ok((
-                dedup_hash,
-                SanitizedLogRecord {
-                    timestamp_unix_nano: ts_ns,
-                    timestamp_ms: ts_ns / 1_000_000,
-                    trace_id: r.get(1)?,
-                    span_id: r.get(2)?,
-                    severity_number: r.get(3)?,
-                    severity_text: r.get(4)?,
-                    service: clean_svc.clone(),
-                    service_name: clean_svc,
-                    node_id: redactor.redact_host(&raw_node),
-                    body: redactor.redact_str(&raw_body),
-                    attributes: redactor.redact_attributes_json(&raw_attrs),
-                    job_id: r.get(9)?,
-                    stage_id: r.get(10)?,
-                    line_no: line_no_u32,
-                    stream: stream_u8,
-                },
-            ))
+            Ok(SanitizedLogRecord {
+                timestamp_unix_nano: ts_ns,
+                timestamp_ms: ts_ns / 1_000_000,
+                trace_id: r.get(1)?,
+                span_id: r.get(2)?,
+                severity_number: r.get(3)?,
+                severity_text: r.get(4)?,
+                service: clean_svc.clone(),
+                service_name: clean_svc,
+                node_id: redactor.redact_host(&raw_node),
+                body: redactor.redact_str(&raw_body),
+                attributes: redactor.redact_attributes_json(&raw_attrs),
+                job_id: r.get(9)?,
+                stage_id: r.get(10)?,
+                line_no: line_no_u32,
+                stream: stream_u8,
+            })
         })?;
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(bounded_limit);
         for r in rows {
-            let (hash, rec) = r?;
-            if matched_hashes.contains(&hash) {
-                out.push(rec);
-            }
+            out.push(r?);
         }
-
-        out.sort_by(|a, b| {
-            b.timestamp_unix_nano
-                .cmp(&a.timestamp_unix_nano)
-                .then_with(|| b.line_no.cmp(&a.line_no))
-        });
-        out.truncate(bounded_limit);
         Ok(out)
     }
 

@@ -153,7 +153,16 @@ async fn test_empirical_ingress_upstream_error_handling_and_duckdb_recording() {
     let store = HotDuckDbStore::open_in_memory().expect("open HotDuckDbStore");
     let engine = IngressEngine::new(store.clone(), "test-node-ingress".into());
 
-    // /api/obs/ routes to 127.0.0.1:9480 which is DOWN (no listener)
+    // Overwrite route-obs to point to closed ephemeral port to guarantee 502 Bad Gateway
+    engine.add_route(
+        "route-obs",
+        "/api/obs/",
+        "http://127.0.0.1:39480/api/",
+        "muobserve",
+        false,
+        false,
+    );
+
     let req = Request::builder()
         .method("GET")
         .uri("/api/obs/v1/health")
@@ -645,14 +654,16 @@ fn test_empirical_vulnerability_zero_mad_masking_latency_spike() {
     let problems = compute_causal_problems(&store, 300, Some(now + 1_000_000_000))
         .expect("compute causal problems");
 
-    // Empirical observation of the vulnerability:
-    // Despite p95 being 5000ms and median being 10ms (a 500x latency regression),
-    // mad is 0.0 because >50% of values are identical. As a result, mad_z collapses
-    // to 0.0 and this massive anomaly is completely silenced!
+    // Verification of the zero-MAD fix:
+    // Despite baseline mad being 0.0, the effective MAD floor enables detecting
+    // this 500x latency regression instead of masking it.
     assert!(
-        problems.is_empty(),
-        "Empirical proof: Zero MAD masks severe 500x latency spikes when status is OK!"
+        !problems.is_empty(),
+        "Zero-MAD latency regression is successfully detected as an anomaly"
     );
+    let prob = &problems[0];
+    assert_eq!(prob.impacted_entity, "uniform-fast-service");
+    assert_eq!(prob.category, "latency_regression");
 }
 
 // ============================================================================
@@ -718,7 +729,16 @@ async fn test_empirical_ingress_malformed_traceparent_graceful_fallback() {
     let store = HotDuckDbStore::open_in_memory().expect("open HotDuckDbStore");
     let engine = IngressEngine::new(store.clone(), "test-node-ingress".into());
 
-    // Route /api/obs/ -> 127.0.0.1:9480 (no listener needed, verifies span recording on fallback)
+    // Overwrite route-obs to point to closed ephemeral port to guarantee 502 Bad Gateway
+    engine.add_route(
+        "route-obs",
+        "/api/obs/",
+        "http://127.0.0.1:39480/api/",
+        "muobserve",
+        false,
+        false,
+    );
+
     let req = Request::builder()
         .method("GET")
         .uri("/api/obs/v1/health")
