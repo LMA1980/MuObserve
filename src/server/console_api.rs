@@ -614,13 +614,17 @@ async fn handle_get_log_facets(
     };
 
     if let Some(ref t) = params.token {
-        if let Err(e) = validate_safe_filter_token(t) {
-            return json_error_response(StatusCode::BAD_REQUEST, e);
+        for part in t.split_whitespace() {
+            if let Err(e) = validate_safe_filter_token(part) {
+                return json_error_response(StatusCode::BAD_REQUEST, e);
+            }
         }
     }
     if let Some(ref q) = params.q {
-        if let Err(e) = validate_safe_filter_token(q) {
-            return json_error_response(StatusCode::BAD_REQUEST, e);
+        for part in q.split_whitespace() {
+            if let Err(e) = validate_safe_filter_token(part) {
+                return json_error_response(StatusCode::BAD_REQUEST, e);
+            }
         }
     }
 
@@ -1439,6 +1443,9 @@ fn scan_parquet_stats(root: &Path) -> (u64, u64) {
 }
 
 fn validate_safe_filter_token(input: &str) -> Result<(), &'static str> {
+    if input.bytes().any(|b| b < 32 || b == 127) {
+        return Err("Control characters are forbidden in filter parameters");
+    }
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("Filter parameter cannot be empty");
@@ -1454,9 +1461,6 @@ fn validate_safe_filter_token(input: &str) -> Result<(), &'static str> {
         return Err("SQL comment and delimiter tokens are forbidden in filter parameters");
     }
     for b in trimmed.bytes() {
-        if b < 32 || b == 127 {
-            return Err("Control characters are forbidden in filter parameters");
-        }
         if !(b.is_ascii_alphanumeric()
             || matches!(
                 b,
@@ -1469,6 +1473,8 @@ fn validate_safe_filter_token(input: &str) -> Result<(), &'static str> {
                     | b'*'
                     | b'?'
                     | b'='
+                    | b'<'
+                    | b'>'
                     | b'+'
                     | b'%'
                     | b'@'
@@ -1504,4 +1510,136 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_safe_filter_token_comparison_operators() {
+        assert!(validate_safe_filter_token("rate>10").is_ok());
+        assert!(validate_safe_filter_token("duration<50").is_ok());
+        assert!(validate_safe_filter_token("latency_ms>=100").is_ok());
+        assert!(validate_safe_filter_token("count<=5").is_ok());
+        assert!(validate_safe_filter_token("status<>200").is_ok());
+        assert!(validate_safe_filter_token("burn_rate>1.5").is_ok());
+        assert!(validate_safe_filter_token("cpu<80%").is_ok());
+        assert!(validate_safe_filter_token("<tag>").is_ok());
+        assert!(validate_safe_filter_token(">100").is_ok());
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_valid_tokens() {
+        assert!(validate_safe_filter_token("service:checkout").is_ok());
+        assert!(validate_safe_filter_token("service:\"checkout\"").is_ok());
+        assert!(validate_safe_filter_token("error*").is_ok());
+        assert!(validate_safe_filter_token("test?").is_ok());
+        assert!(validate_safe_filter_token("[stage-1]").is_ok());
+        assert!(validate_safe_filter_token("(group-a)").is_ok());
+        assert!(validate_safe_filter_token("app:\"web\"").is_ok());
+        assert!(validate_safe_filter_token("tag#prod").is_ok());
+        assert!(validate_safe_filter_token("a+b").is_ok());
+        assert!(validate_safe_filter_token("fuzzy~2").is_ok());
+        assert!(validate_safe_filter_token("key=value").is_ok());
+        assert!(validate_safe_filter_token("val!error").is_ok());
+        assert!(validate_safe_filter_token("a,b,c").is_ok());
+        assert!(validate_safe_filter_token("@user").is_ok());
+        assert!(validate_safe_filter_token("job_123-abc.xyz/endpoint").is_ok());
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_sql_delimiters_and_comments() {
+        assert_eq!(
+            validate_safe_filter_token("rate>10; DROP TABLE v_logs;"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token(";"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10--comment"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("duration<50/*inline*/"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("*/dangling"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("<!--xml-->"),
+            Err("SQL comment and delimiter tokens are forbidden in filter parameters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_control_characters() {
+        assert_eq!(
+            validate_safe_filter_token("rate>10\n"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\0"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\t"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\r"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10\x7F"),
+            Err("Control characters are forbidden in filter parameters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_rejects_disallowed_metacharacters() {
+        assert_eq!(
+            validate_safe_filter_token("`rate`>10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>10||1=1"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("rate>\\10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("$rate>10"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+        assert_eq!(
+            validate_safe_filter_token("{rate>10}"),
+            Err("Filter parameter contains disallowed SQL metacharacters")
+        );
+    }
+
+    #[test]
+    fn test_validate_safe_filter_token_boundary_conditions() {
+        assert_eq!(
+            validate_safe_filter_token(""),
+            Err("Filter parameter cannot be empty")
+        );
+        assert_eq!(
+            validate_safe_filter_token("   "),
+            Err("Filter parameter cannot be empty")
+        );
+        let exact_256 = "a".repeat(256);
+        assert!(validate_safe_filter_token(&exact_256).is_ok());
+        let over_256 = "a".repeat(257);
+        assert_eq!(
+            validate_safe_filter_token(&over_256),
+            Err("Filter parameter exceeds maximum length (256)")
+        );
+    }
 }
