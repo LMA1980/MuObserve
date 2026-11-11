@@ -52,10 +52,25 @@ async fn main() {
         let mcp_http_addr = std::env::var("MUOBSERVE_MCP_HTTP_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:9480".to_string());
         let mcp_store = store.clone();
+        let node_id = std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+        let ingress_engine = mu_observable_hub::IngressEngine::new(store.clone(), node_id);
+        mu_observable_hub::UpstreamHealthChecker::spawn(
+            ingress_engine.clone(),
+            std::time::Duration::from_secs(10),
+        );
+        let ingress_for_server = ingress_engine.clone();
+        let console_store = store.clone();
+
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&mcp_http_addr).await {
-                tracing::info!(%mcp_http_addr, "MuObserve MCP HTTP/SSE server listening");
-                let _ = axum::serve(listener, McpServer::new(mcp_store).router()).await;
+                tracing::info!(%mcp_http_addr, "MuObserve MCP HTTP/SSE & Ingress server listening");
+                let router = McpServer::new(mcp_store).router().merge(
+                    mu_observable_hub::server::build_console_api_router_with_ingress(
+                        console_store,
+                        ingress_for_server,
+                    ),
+                );
+                let _ = axum::serve(listener, router).await;
             }
         });
 

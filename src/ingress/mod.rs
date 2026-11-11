@@ -107,22 +107,12 @@ pub struct IngressEngine {
 impl IngressEngine {
     /// Creates and initializes a new [`IngressEngine`].
     pub fn new(store: HotDuckDbStore, node_id: String) -> Arc<Self> {
-        let default_tls = TlsHealthDto {
-            domain: "console.k3.internal".into(),
-            certificate_issuer: "step-ca intermediate".into(),
-            valid_until_epoch_ms: chrono::Utc::now().timestamp_millis() + 86_400_000 * 90,
-            days_remaining: 90,
-            alpn_protocols: vec!["h2".into(), "http/1.1".into()],
-            ocsp_stapling: true,
-            mutual_tls: true,
-        };
-
         let engine = Arc::new(Self {
             store,
             node_id,
             routes: RwLock::new(Vec::new()),
             upstreams: RwLock::new(HashMap::new()),
-            tls_health: RwLock::new(Some(default_tls)),
+            tls_health: RwLock::new(None),
         });
 
         engine.register_default_routes_sync();
@@ -150,7 +140,7 @@ impl IngressEngine {
             (
                 "route-cd",
                 "/api/cd/",
-                "http://127.0.0.1:8080/api/",
+                "http://127.0.0.1:8444/api/",
                 "muconde-controller",
                 false,
                 false,
@@ -198,9 +188,9 @@ impl IngressEngine {
                     target_url: upstream_url.into(),
                     service_name: svc.into(),
                     health_state: Mutex::new("HEALTHY".into()),
-                    latency_ms: Mutex::new(2.5),
-                    success_count: AtomicU64::new(10),
-                    total_probes: AtomicU64::new(10),
+                    latency_ms: Mutex::new(0.0),
+                    success_count: AtomicU64::new(0),
+                    total_probes: AtomicU64::new(0),
                     active_connections: AtomicU32::new(0),
                     last_check_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
                     consecutive_failures: AtomicU32::new(0),
@@ -245,9 +235,9 @@ impl IngressEngine {
                 target_url: upstream_url.into(),
                 service_name: service_name.into(),
                 health_state: Mutex::new("HEALTHY".into()),
-                latency_ms: Mutex::new(2.5),
-                success_count: AtomicU64::new(10),
-                total_probes: AtomicU64::new(10),
+                latency_ms: Mutex::new(0.0),
+                success_count: AtomicU64::new(0),
+                total_probes: AtomicU64::new(0),
                 active_connections: AtomicU32::new(0),
                 last_check_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
                 consecutive_failures: AtomicU32::new(0),
@@ -287,7 +277,7 @@ impl IngressEngine {
 
             let samples_guard = r.latency_samples.lock().unwrap();
             let p95 = if samples_guard.is_empty() {
-                5.0
+                0.0
             } else {
                 let mut sorted: Vec<f64> = samples_guard.iter().copied().collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -379,9 +369,9 @@ impl IngressEngine {
                     target_url: upstream_url.to_string(),
                     service_name: service_name.to_string(),
                     health_state: Mutex::new("HEALTHY".into()),
-                    latency_ms: Mutex::new(2.0),
-                    success_count: AtomicU64::new(1),
-                    total_probes: AtomicU64::new(1),
+                    latency_ms: Mutex::new(0.0),
+                    success_count: AtomicU64::new(0),
+                    total_probes: AtomicU64::new(0),
                     active_connections: AtomicU32::new(0),
                     last_check_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
                     consecutive_failures: AtomicU32::new(0),
@@ -411,6 +401,34 @@ impl IngressEngine {
             }
         };
 
+        // Authentication gate
+        if route.auth_required {
+            let auth_header = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok());
+            let has_bearer = auth_header
+                .and_then(|val| {
+                    val.strip_prefix("Bearer ")
+                        .or_else(|| val.strip_prefix("bearer "))
+                })
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+
+            if !has_bearer {
+                return Ok(axum::response::Response::builder()
+                    .status(axum::http::StatusCode::UNAUTHORIZED)
+                    .header(
+                        axum::http::header::WWW_AUTHENTICATE,
+                        "Bearer realm=\"mu-ingress\"",
+                    )
+                    .body(axum::body::Body::from(
+                        "Unauthorized: Bearer token required",
+                    ))
+                    .unwrap_or_default());
+            }
+        }
+
         // Extract incoming W3C traceparent or derive root
         let incoming_parent = req
             .headers()
@@ -426,15 +444,44 @@ impl IngressEngine {
         };
         let upstream_child_ctx = server_ctx.next_deterministic_child(2);
 
-        // Path rewriting
+        // Path rewriting with base path preservation
+        let (host, port, base_path) = parse_host_port(&route.upstream_url);
         let target_path = if route.strip_prefix {
-            path.strip_prefix(&route.path_prefix).unwrap_or(&path)
+            let stripped = path.strip_prefix(&route.path_prefix).unwrap_or(&path);
+            let clean_subpath = stripped.strip_prefix('/').unwrap_or(stripped);
+            if base_path.is_empty() || base_path == "/" {
+                format!("/{clean_subpath}")
+            } else {
+                let clean_base = base_path.trim_end_matches('/');
+                if clean_subpath.is_empty() {
+                    if base_path.ends_with('/') {
+                        format!("{clean_base}/")
+                    } else {
+                        clean_base.to_string()
+                    }
+                } else {
+                    format!("{clean_base}/{clean_subpath}")
+                }
+            }
+        } else if base_path.is_empty() || base_path == "/" {
+            if path.starts_with('/') {
+                path.clone()
+            } else {
+                format!("/{path}")
+            }
         } else {
-            &path
+            let clean_base = base_path.trim_end_matches('/');
+            let clean_path = path.strip_prefix('/').unwrap_or(&path);
+            if path.starts_with(clean_base) {
+                path.clone()
+            } else {
+                format!("{clean_base}/{clean_path}")
+            }
         };
+
         let target_uri = match req.uri().query() {
             Some(q) => format!("{target_path}?{q}"),
-            None => target_path.to_string(),
+            None => target_path,
         };
 
         // Track active connection
@@ -444,7 +491,6 @@ impl IngressEngine {
         upstream.active_connections.fetch_add(1, Ordering::SeqCst);
 
         // Forward HTTP request
-        let (host, port) = parse_host_port(&route.upstream_url);
         let resp_result = forward_http(host, port, &target_uri, req, &upstream_child_ctx).await;
         upstream.active_connections.fetch_sub(1, Ordering::SeqCst);
 
@@ -527,7 +573,7 @@ impl UpstreamHealthChecker {
                 };
 
                 for up in upstreams {
-                    let (host, port) = parse_host_port(&up.target_url);
+                    let (host, port, _) = parse_host_port(&up.target_url);
                     let start = std::time::Instant::now();
                     let success = tokio::time::timeout(
                         Duration::from_secs(2),
@@ -568,20 +614,25 @@ impl UpstreamHealthChecker {
     }
 }
 
-fn parse_host_port(target_url: &str) -> (String, u16) {
+fn parse_host_port(target_url: &str) -> (String, u16, String) {
     let trimmed = target_url
         .strip_prefix("http://")
         .or_else(|| target_url.strip_prefix("https://"))
         .unwrap_or(target_url);
 
-    let authority = trimmed.split('/').next().unwrap_or(trimmed);
+    let slash_pos = trimmed.find('/');
+    let (authority, base_path) = match slash_pos {
+        Some(pos) => (&trimmed[..pos], &trimmed[pos..]),
+        None => (trimmed, ""),
+    };
+
     let mut parts = authority.split(':');
     let host = parts.next().unwrap_or("127.0.0.1").to_string();
     let port = parts
         .next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(80);
-    (host, port)
+    (host, port, base_path.to_string())
 }
 
 async fn forward_http(
@@ -636,12 +687,6 @@ async fn forward_http(
         .map_err(|e| format!("Upstream request failed: {e}"))?;
 
     let (resp_parts, resp_body) = resp.into_parts();
-    let resp_bytes = resp_body
-        .collect()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?
-        .to_bytes();
-
     let mut axum_resp = axum::response::Response::builder().status(resp_parts.status);
     for (name, val) in resp_parts.headers {
         if let Some(n) = name {
@@ -650,7 +695,7 @@ async fn forward_http(
     }
 
     axum_resp
-        .body(axum::body::Body::from(resp_bytes))
+        .body(axum::body::Body::new(resp_body))
         .map_err(|e| format!("Failed to construct axum response: {e}"))
 }
 
@@ -674,6 +719,33 @@ mod tests {
         let overview = engine.get_overview_dto().await;
         assert_eq!(overview.routes.len(), 5);
         assert!(!overview.upstreams.is_empty());
+        assert!(overview.tls_health.is_none());
+
+        engine
+            .set_tls_health(TlsHealthDto {
+                domain: "console.k3.internal".into(),
+                certificate_issuer: "step-ca intermediate".into(),
+                valid_until_epoch_ms: 1_705_000_000_000,
+                days_remaining: 58,
+                alpn_protocols: vec!["h2".into(), "http/1.1".into()],
+                ocsp_stapling: true,
+                mutual_tls: true,
+            })
+            .await;
+        let overview = engine.get_overview_dto().await;
         assert!(overview.tls_health.is_some());
+    }
+
+    #[test]
+    fn test_parse_host_port_with_base_path() {
+        let (host, port, base) = parse_host_port("http://127.0.0.1:8443/api/");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8443);
+        assert_eq!(base, "/api/");
+
+        let (host, port, base) = parse_host_port("http://node-a:8000");
+        assert_eq!(host, "node-a");
+        assert_eq!(port, 8000);
+        assert_eq!(base, "");
     }
 }

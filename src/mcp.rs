@@ -33,6 +33,8 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "inspect_node_utilization",
     "compare_cluster_efficiency",
     "execute_analytics_sql",
+    "analyze_causal_root_cause",
+    "diagnose_anomaly_ai",
 ];
 
 /// JSON-RPC 2.0 request envelope for MCP (`initialize`, `tools/list`, `tools/call`).
@@ -212,6 +214,29 @@ impl McpServer {
                             "max_rows": { "type": "integer", "default": 1000 }
                         },
                         "required": ["sql"]
+                    }
+                },
+                {
+                    "name": "analyze_causal_root_cause",
+                    "description": "Analyze causal root cause of latency and error anomalies across distributed traces and logs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "window_secs": { "type": "integer", "default": 300 },
+                            "service_name": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "diagnose_anomaly_ai",
+                    "description": "Generate AI-powered root-cause diagnosis for an anomaly trace using statistical inference or SLM synthesis.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "trace_id": { "type": "string" },
+                            "service_name": { "type": "string" }
+                        },
+                        "required": ["trace_id"]
                     }
                 }
             ]
@@ -629,6 +654,66 @@ impl McpServer {
                 )?;
                 Ok(serde_json::to_value(res)?)
             }
+            "analyze_causal_root_cause" => {
+                let window_secs = args
+                    .get("window_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(300);
+                let service_filter = opt_str(args, "service_name");
+                let mut problems = crate::analytics::causal::compute_causal_problems(
+                    &self.store,
+                    window_secs,
+                    None,
+                )?;
+                if let Some(svc) = service_filter {
+                    problems.retain(|p| {
+                        p.impacted_entity == svc
+                            || p.root_cause_service == svc
+                            || p.affected_services.contains(&svc)
+                    });
+                }
+                Ok(json!({
+                    "problem_count": problems.len(),
+                    "problems": problems
+                }))
+            }
+            "diagnose_anomaly_ai" => {
+                let trace_id = required_str(args, "trace_id")?;
+                let service_name =
+                    opt_str(args, "service_name").unwrap_or_else(|| "unknown".into());
+                let problems =
+                    crate::analytics::causal::compute_causal_problems(&self.store, 300, None)?;
+                if let Some(card) = problems
+                    .into_iter()
+                    .find(|p| p.root_cause_trace_id.as_deref() == Some(&trace_id))
+                {
+                    Ok(json!({
+                        "trace_id": trace_id,
+                        "problem_id": card.problem_id,
+                        "impacted_entity": card.impacted_entity,
+                        "root_cause_service": card.root_cause_service,
+                        "causal_chain": card.causal_chain,
+                        "confidence_score": card.confidence_score,
+                        "ai_diagnosis": card.ai_diagnosis,
+                        "summary": card.summary,
+                    }))
+                } else {
+                    let fallback_diag = crate::analytics::causal::generate_statistical_diagnosis(
+                        &service_name,
+                        &service_name,
+                        std::slice::from_ref(&service_name),
+                        None,
+                        "trace_inspection",
+                        0.70,
+                    );
+                    Ok(json!({
+                        "trace_id": trace_id,
+                        "impacted_entity": service_name,
+                        "root_cause_service": service_name,
+                        "ai_diagnosis": fallback_diag,
+                    }))
+                }
+            }
             other => Err(MuObserveError::Validation(format!(
                 "Unknown MCP tool: {other}"
             ))),
@@ -867,7 +952,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools_arr.len(), 10);
+        assert_eq!(tools_arr.len(), MCP_TOOL_NAMES.len());
         for expected_name in MCP_TOOL_NAMES {
             assert!(
                 tools_arr
@@ -877,7 +962,16 @@ mod tests {
             );
         }
 
-        // Call each of the 10 tools
+        // Call each of the MCP tools
+        assert!(mcp
+            .call_tool("analyze_causal_root_cause", &json!({"window_secs": 300}))
+            .is_ok());
+        assert!(mcp
+            .call_tool(
+                "diagnose_anomaly_ai",
+                &json!({"trace_id": "test-trace-id", "service_name": "checkout"})
+            )
+            .is_ok());
         assert!(mcp
             .call_tool(
                 "check_benchmark_regressions",
