@@ -153,11 +153,18 @@ async fn test_empirical_ingress_upstream_error_handling_and_duckdb_recording() {
     let store = HotDuckDbStore::open_in_memory().expect("open HotDuckDbStore");
     let engine = IngressEngine::new(store.clone(), "test-node-ingress".into());
 
-    // Overwrite route-obs to point to closed ephemeral port to guarantee 502 Bad Gateway
+    // Allocate a dynamic closed ephemeral port to guarantee 502 Bad Gateway
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    };
+    let closed_upstream = format!("http://127.0.0.1:{closed_port}/api/");
     engine.add_route(
         "route-obs",
         "/api/obs/",
-        "http://127.0.0.1:39480/api/",
+        &closed_upstream,
         "muobserve",
         false,
         false,
@@ -729,11 +736,18 @@ async fn test_empirical_ingress_malformed_traceparent_graceful_fallback() {
     let store = HotDuckDbStore::open_in_memory().expect("open HotDuckDbStore");
     let engine = IngressEngine::new(store.clone(), "test-node-ingress".into());
 
-    // Overwrite route-obs to point to closed ephemeral port to guarantee 502 Bad Gateway
+    // Allocate a dynamic closed ephemeral port to guarantee 502 Bad Gateway
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    };
+    let closed_upstream = format!("http://127.0.0.1:{closed_port}/api/");
     engine.add_route(
         "route-obs",
         "/api/obs/",
-        "http://127.0.0.1:39480/api/",
+        &closed_upstream,
         "muobserve",
         false,
         false,
