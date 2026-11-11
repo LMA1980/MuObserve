@@ -13,8 +13,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use mu_observable_hub::{
-    build_console_api_router, compute_causal_problems, HotDuckDbStore, IngressEngine,
-    UpstreamHealthChecker,
+    build_console_api_router, compute_causal_problems, tokenize_log_line, HotDuckDbStore,
+    IngressEngine, UpstreamHealthChecker,
 };
 use mu_observable_ipc::{OtelLogEntry, OtelSpanEntry};
 use std::time::Duration;
@@ -1147,4 +1147,241 @@ async fn test_empirical_persistent_sse_concurrent_10_clients_distribution() {
             "Client {client_idx} failed to receive all 5 broadcast events (received: {count})"
         );
     }
+}
+
+#[tokio::test]
+async fn test_empirical_ai_diagnosis_synthesis_and_fallback() {
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+
+    // 1. Spin up mock OpenAI server mimicking jero-manager /v1/chat/completions
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind mock jero-manager");
+    let actual_port = listener.local_addr().expect("local addr").port();
+
+    let server_handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let io = TokioIo::new(stream);
+            tokio::spawn(async move {
+                let service = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.uri().path(), "/v1/chat/completions");
+                    assert_eq!(req.method(), hyper::Method::POST);
+                    let resp_body = serde_json::json!({
+                        "id": "chatcmpl-test-ai-synthesis",
+                        "object": "chat.completion",
+                        "created": 1700000000,
+                        "model": "jero",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "AI RCA Diagnosis: Root bottleneck isolated to inventory-db due to locking contention."
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    });
+                    let resp = hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            serde_json::to_vec(&resp_body).unwrap(),
+                        )))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                });
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+
+    // 2. Test authentic AI synthesis with valid JERO_MANAGER_URL
+    std::env::set_var(
+        "JERO_MANAGER_URL",
+        format!("http://127.0.0.1:{actual_port}"),
+    );
+    let chain = vec!["mu-ingress".to_string(), "inventory-db".to_string()];
+    let res = mu_observable_hub::synthesize_ai_diagnosis(
+        "mu-ingress",
+        "inventory-db",
+        &chain,
+        Some("connection refused"),
+        "error_rate",
+        0.95,
+    )
+    .await;
+    assert!(
+        res.contains("AI RCA Diagnosis: Root bottleneck isolated to inventory-db"),
+        "Expected authentic AI diagnosis synthesis from mock jero-manager endpoint, got: {res}"
+    );
+
+    // 3. Test reliable statistical fallback when JERO_MANAGER_URL is unreachable
+    let closed_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    std::env::set_var(
+        "JERO_MANAGER_URL",
+        format!("http://127.0.0.1:{closed_port}"),
+    );
+    let fallback_res = mu_observable_hub::synthesize_ai_diagnosis(
+        "mu-ingress",
+        "inventory-db",
+        &chain,
+        Some("connection refused"),
+        "error_rate",
+        0.95,
+    )
+    .await;
+    assert!(
+        fallback_res.contains("Statistical Root-Cause Synthesis"),
+        "Expected deterministic statistical fallback on connection failure, got: {fallback_res}"
+    );
+
+    // Clean up
+    server_handle.abort();
+    std::env::remove_var("JERO_MANAGER_URL");
+}
+
+#[tokio::test]
+async fn test_empirical_ingress_hardening_loop_auth_body_limit_ssrf() {
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let router = build_console_api_router(store.clone());
+
+    // 1. Loop detection gate: x-ingress-loop present returns 508 Loop Detected
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/obs/v1/problems")
+        .header("x-ingress-loop", "1")
+        .body(Body::empty())
+        .unwrap();
+    let resp_native = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp_native.status(), StatusCode::OK);
+    // Direct native route should answer directly without fallback, but if hitting proxy fallback:
+    let req_proxy = Request::builder()
+        .method("GET")
+        .uri("/api/unmapped/endpoint")
+        .header("x-ingress-loop", "1")
+        .body(Body::empty())
+        .unwrap();
+    let resp_proxy = router.clone().oneshot(req_proxy).await.unwrap();
+    assert_eq!(resp_proxy.status(), StatusCode::LOOP_DETECTED);
+
+    // 2. Admin authentication and SSRF validation on POST /api/v1/ingress/routes
+    // 2a. Missing Bearer auth -> 401 Unauthorized
+    let unauth_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"route_id":"r1","path_prefix":"/test/","upstream_url":"http://127.0.0.1:8000"}"#,
+        ))
+        .unwrap();
+    let unauth_resp = router.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2b. SSRF block on cloud metadata IP 169.254.169.254 -> 400 Bad Request
+    let ssrf_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"route_id":"r-ssrf","path_prefix":"/ssrf/","upstream_url":"http://169.254.169.254/latest/meta-data"}"#))
+        .unwrap();
+    let ssrf_resp = router.clone().oneshot(ssrf_req).await.unwrap();
+    assert_eq!(ssrf_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2c. SSRF block on 0.0.0.0 wildcard address -> 400 Bad Request
+    let wildcard_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"route_id":"r-wildcard","path_prefix":"/wild/","upstream_url":"http://0.0.0.0:8000"}"#))
+        .unwrap();
+    let wildcard_resp = router.clone().oneshot(wildcard_req).await.unwrap();
+    assert_eq!(wildcard_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2d. Invalid path prefix (missing leading '/') -> 400 Bad Request
+    let bad_prefix_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"route_id":"r-bad","path_prefix":"noprefix","upstream_url":"http://127.0.0.1:8000"}"#))
+        .unwrap();
+    let bad_prefix_resp = router.clone().oneshot(bad_prefix_req).await.unwrap();
+    assert_eq!(bad_prefix_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2e. Valid route registration -> 201 Created
+    let valid_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"route_id":"r-valid","path_prefix":"/test-service/","upstream_url":"http://127.0.0.1:8000","auth_required":true}"#))
+        .unwrap();
+    let valid_resp = router.clone().oneshot(valid_req).await.unwrap();
+    assert_eq!(valid_resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_empirical_log_search_sql_pushdown_and_comparison_operators() {
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+
+    // 1. Verify preservation of < and > in tokenizer
+    let entry = OtelLogEntry {
+        timestamp_unix_nano: 1_700_000_000_000_000_000,
+        trace_id: "tr-test-1".into(),
+        span_id: "sp-test-1".into(),
+        severity_number: 17,
+        severity_text: "ERROR".into(),
+        service_name: "test-service".into(),
+        node_id: "node-a".into(),
+        body: "Threshold exceeded: rate>10 requests/sec with latency<50ms".into(),
+        attributes_json: r#"{"line_no":1,"stream":1}"#.into(),
+        job_id: Some("job-1".into()),
+        stage_id: Some("stage-1".into()),
+    };
+    let tokens = tokenize_log_line(&entry, &entry.body);
+    assert!(
+        tokens.contains(&"rate>10".to_string()),
+        "Tokens must preserve rate>10: {tokens:?}"
+    );
+    assert!(
+        tokens.contains(&"latency<50ms".to_string()),
+        "Tokens must preserve latency<50ms: {tokens:?}"
+    );
+
+    // 2. Insert logs and verify SQL pushdown bounds & facets
+    store
+        .insert_logs(std::slice::from_ref(&entry))
+        .expect("insert log");
+
+    let router = build_console_api_router(store.clone());
+
+    // 3. Query with from & to time bounds does not return 400 Bad Request
+    let logs_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?from=1699999000000&to=1700001000000&severity=error")
+        .body(Body::empty())
+        .unwrap();
+    let logs_resp = router.clone().oneshot(logs_req).await.unwrap();
+    assert_eq!(logs_resp.status(), StatusCode::OK);
+
+    // 4. Query facets with token filter
+    let facets_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs/facets?q=rate%3E10")
+        .body(Body::empty())
+        .unwrap();
+    let facets_resp = router.clone().oneshot(facets_req).await.unwrap();
+    assert_eq!(facets_resp.status(), StatusCode::OK);
 }

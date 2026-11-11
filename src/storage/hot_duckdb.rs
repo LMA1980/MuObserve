@@ -107,14 +107,18 @@ pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(MAX_TOKENS_PER_LINE);
 
     let mut push_tokens = |text: &str| {
-        for raw in
-            text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
-        {
+        for raw in text.split(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '<' | '>'))
+        }) {
             if out.len() >= MAX_TOKENS_PER_LINE {
                 break;
             }
             let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
-            if trimmed.len() < 2 || !trimmed.bytes().any(|b| b.is_ascii_alphanumeric()) {
+            if trimmed.len() < 2
+                || !trimmed
+                    .bytes()
+                    .any(|b| b.is_ascii_alphanumeric() || matches!(b, b'<' | b'>'))
+            {
                 continue;
             }
             let lower = trimmed.to_ascii_lowercase();
@@ -139,11 +143,15 @@ pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
 fn tokenize_query_text(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for raw in
-        query.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
-    {
+    for raw in query.split(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '<' | '>'))
+    }) {
         let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
-        if trimmed.len() < 2 || !trimmed.bytes().any(|b| b.is_ascii_alphanumeric()) {
+        if trimmed.len() < 2
+            || !trimmed
+                .bytes()
+                .any(|b| b.is_ascii_alphanumeric() || matches!(b, b'<' | b'>'))
+        {
             continue;
         }
         let lower = trimmed.to_ascii_lowercase();
@@ -825,6 +833,55 @@ impl HotDuckDbStore {
         self.insert_logs(&entries)
     }
 
+    /// Resolves candidate deduplication hashes from `log_inverted_index` for a tokenized query.
+    /// Returns `Ok(None)` if `token_query` contains no valid tokens.
+    /// Returns `Ok(Some(empty_set))` if tokens were queried but produced 0 matches.
+    /// Returns `Ok(Some(matched_set))` if matching deduplication hashes were found.
+    pub fn candidate_hashes_for_query(
+        &self,
+        token_query: &str,
+        job_id: Option<&str>,
+    ) -> Result<Option<HashSet<u64>>, StorageError> {
+        let conn = self.lock_conn()?;
+        Self::candidate_hashes_for_query_conn(&conn, token_query, job_id)
+    }
+
+    pub(crate) fn candidate_hashes_for_query_conn(
+        conn: &duckdb::Connection,
+        token_query: &str,
+        job_id: Option<&str>,
+    ) -> Result<Option<HashSet<u64>>, StorageError> {
+        let query_tokens = tokenize_query_text(token_query);
+        if query_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        let mut candidate_hashes: Option<HashSet<u64>> = None;
+        let mut idx_stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT dedup_hash
+            FROM log_inverted_index
+            WHERE token = ?1
+              AND (?2 IS NULL OR job_id = ?2)
+            "#,
+        )?;
+        for tok in &query_tokens {
+            let rows = idx_stmt.query_map(params![tok, job_id], |r| r.get::<_, u64>(0))?;
+            let mut set = HashSet::new();
+            for h in rows {
+                set.insert(h?);
+            }
+            candidate_hashes = Some(match candidate_hashes {
+                None => set,
+                Some(prev) => prev.intersection(&set).copied().collect(),
+            });
+            if candidate_hashes.as_ref().is_some_and(HashSet::is_empty) {
+                return Ok(Some(HashSet::new()));
+            }
+        }
+        Ok(candidate_hashes)
+    }
+
     /// Searches logs via the OpenSearch-style inverted token index (`log_inverted_index`),
     /// joining against `v_logs` (spanning both hot DuckDB and cold Parquet shards), and returns
     /// sanitized [`SanitizedLogRecord`] rows ordered by `timestamp_unix_nano DESC, line_no DESC`.
@@ -834,8 +891,7 @@ impl HotDuckDbStore {
         job_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SanitizedLogRecord>, StorageError> {
-        let query_tokens = tokenize_query_text(token_query);
-        if query_tokens.is_empty() || limit == 0 {
+        if limit == 0 {
             return Ok(Vec::new());
         }
 
@@ -843,41 +899,21 @@ impl HotDuckDbStore {
         let redactor = PrivacyRedactor::new();
         let conn = self.lock_conn()?;
 
-        let mut candidate_hashes: Option<HashSet<u64>> = None;
-        {
-            let mut idx_stmt = conn.prepare(
-                r#"
-                SELECT DISTINCT dedup_hash
-                FROM log_inverted_index
-                WHERE token = ?1
-                  AND (?2 IS NULL OR job_id = ?2)
-                "#,
-            )?;
-            for tok in &query_tokens {
-                let rows = idx_stmt.query_map(params![tok, job_id], |r| r.get::<_, u64>(0))?;
-                let mut set = HashSet::new();
-                for h in rows {
-                    set.insert(h?);
-                }
-                candidate_hashes = Some(match candidate_hashes {
-                    None => set,
-                    Some(prev) => prev.intersection(&set).copied().collect(),
-                });
-                if candidate_hashes.as_ref().is_some_and(HashSet::is_empty) {
-                    return Ok(Vec::new());
-                }
-            }
-        }
-
-        let Some(matched_hashes) = candidate_hashes.filter(|s| !s.is_empty()) else {
+        let Some(matched_hashes) =
+            Self::candidate_hashes_for_query_conn(&conn, token_query, job_id)?
+        else {
             return Ok(Vec::new());
         };
+        if matched_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let hash_csv = matched_hashes
-            .iter()
-            .map(|h| h.to_string())
+        let matched_hashes_vec: Vec<u64> = matched_hashes.into_iter().collect();
+        let placeholders = (2..=matched_hashes_vec.len() + 1)
+            .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
-            .join(",");
+            .join(", ");
+        let limit_idx = matched_hashes_vec.len() + 2;
 
         let sql = format!(
             r#"
@@ -887,14 +923,23 @@ impl HotDuckDbStore {
                 COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
             FROM v_logs
             WHERE (?1 IS NULL OR job_id = ?1)
-              AND dedup_hash IN ({hash_csv})
+              AND dedup_hash IN ({placeholders})
             ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
-            LIMIT ?2
+            LIMIT ?{limit_idx}
             "#
         );
 
+        let lim = bounded_limit as i64;
+        let mut param_refs: Vec<&dyn duckdb::types::ToSql> =
+            Vec::with_capacity(matched_hashes_vec.len() + 2);
+        param_refs.push(&job_id);
+        for h in &matched_hashes_vec {
+            param_refs.push(h);
+        }
+        param_refs.push(&lim);
+
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![job_id, bounded_limit as i64], |r| {
+        let rows = stmt.query_map(&param_refs[..], |r| {
             let ts_ns: i64 = r.get(0)?;
             let raw_svc: String = r.get(5)?;
             let raw_node: String = r.get(6)?;

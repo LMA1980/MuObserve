@@ -4,7 +4,10 @@ pub mod regression;
 pub mod slo;
 pub mod smartscape;
 
-pub use causal::{compute_causal_problems, CausalProblemCard, CausalProblemsFeedResponse};
+pub use causal::{
+    compute_causal_problems, generate_statistical_diagnosis, synthesize_ai_diagnosis,
+    CausalProblemCard, CausalProblemsFeedResponse,
+};
 pub use purepath::{
     compute_purepath_waterfall, list_trace_summaries, PurePathLogEntry, PurePathMetricEntry,
     PurePathResponse, PurePathSpanNode, TraceListFilter, TraceListQuery, TraceListResponse,

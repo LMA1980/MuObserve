@@ -465,6 +465,7 @@ pub async fn synthesize_ai_diagnosis(
 async fn call_chat_completion(base_url: &str, prompt: &str) -> Result<String, String> {
     let clean_url = base_url.trim_end_matches('/');
     let target = format!("{clean_url}/v1/chat/completions");
+    let is_https = target.starts_with("https://");
     let trimmed = target
         .strip_prefix("http://")
         .or_else(|| target.strip_prefix("https://"))
@@ -478,10 +479,11 @@ async fn call_chat_completion(base_url: &str, prompt: &str) -> Result<String, St
 
     let mut parts = authority.split(':');
     let host = parts.next().unwrap_or("127.0.0.1");
+    let default_port = if is_https { 443 } else { 80 };
     let port = parts
         .next()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(80);
+        .unwrap_or(default_port);
 
     let stream = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -491,14 +493,54 @@ async fn call_chat_completion(base_url: &str, prompt: &str) -> Result<String, St
     .map_err(|e| format!("Connect timeout: {e}"))?
     .map_err(|e| format!("Connect error: {e}"))?;
 
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| format!("Handshake error: {e}"))?;
+    let mut sender = if is_https {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+        if let Ok(ca_path) =
+            std::env::var("MUOBSERVE_TLS_CA").or_else(|_| std::env::var("SSL_CERT_FILE"))
+        {
+            if let Ok(ca_file) = std::fs::File::open(&ca_path) {
+                use rustls::pki_types::pem::PemObject;
+                let mut reader = std::io::BufReader::new(ca_file);
+                for cert in rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader).flatten()
+                {
+                    let _ = root_store.add(cert);
+                }
+            }
+        }
+
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid DNS name '{host}': {e}"))?;
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| format!("TLS connect failed: {e}"))?;
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("Handshake error: {e}"))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    } else {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("Handshake error: {e}"))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    };
 
     let payload = serde_json::json!({
         "model": "jero",

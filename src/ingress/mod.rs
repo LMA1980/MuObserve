@@ -13,6 +13,7 @@ use std::time::Duration;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use mu_observable_ipc::{OtelSpanEntry, TraceContext};
+use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 
 use crate::error::MuObserveError;
@@ -95,6 +96,14 @@ pub struct IngressUpstreamState {
     pub consecutive_failures: AtomicU32,
 }
 
+/// Constant-time byte comparison preventing timing side-channel attacks.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Central Ingress Reverse-Proxy Engine.
 pub struct IngressEngine {
     store: HotDuckDbStore,
@@ -119,49 +128,68 @@ impl IngressEngine {
         engine
     }
 
-    fn register_default_routes_sync(&self) {
-        let defaults = vec![
+    /// Returns the canonical default ingress route definitions.
+    pub fn default_routes() -> Vec<(&'static str, &'static str, String, &'static str, bool, bool)> {
+        let ci_base = std::env::var("ACTIONRUNNER_CONTROLLER_URL")
+            .or_else(|_| std::env::var("MUCI_CONTROLLER_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+        let ci_upstream = if ci_base.ends_with("/api") || ci_base.ends_with("/api/") {
+            if ci_base.ends_with('/') {
+                ci_base
+            } else {
+                format!("{ci_base}/")
+            }
+        } else {
+            let trimmed = ci_base.trim_end_matches('/');
+            format!("{trimmed}/api/")
+        };
+
+        vec![
             (
                 "route-reg",
                 "/api/reg/",
-                "http://127.0.0.1:8443/api/",
+                "http://127.0.0.1:8443/api/".to_string(),
                 "muregist",
-                false,
+                true,
                 false,
             ),
             (
                 "route-ci",
                 "/api/ci/",
-                "http://192.0.2.10:8000/api/",
+                ci_upstream,
                 "actionrunner-controller",
-                false,
+                true,
                 false,
             ),
             (
                 "route-cd",
                 "/api/cd/",
-                "http://127.0.0.1:8444/api/",
+                "http://127.0.0.1:8444/api/cd/".to_string(),
                 "muconde-controller",
-                false,
+                true,
                 false,
             ),
             (
                 "route-obs",
                 "/api/obs/",
-                "http://127.0.0.1:9480/api/",
+                "http://127.0.0.1:9480/api/".to_string(),
                 "muobserve",
-                false,
+                true,
                 false,
             ),
             (
                 "route-reg-v1",
                 "/api/v1/registry/",
-                "http://127.0.0.1:8443/api/v1/",
+                "http://127.0.0.1:8443/api/v1/registry/".to_string(),
                 "muregist",
-                false,
+                true,
                 false,
             ),
-        ];
+        ]
+    }
+
+    fn register_default_routes_sync(&self) {
+        let defaults = Self::default_routes();
 
         let mut r_guard = self.routes.write().unwrap();
         let mut u_guard = self.upstreams.write().unwrap();
@@ -170,7 +198,7 @@ impl IngressEngine {
             r_guard.push(Arc::new(IngressRouteState {
                 route_id: r_id.into(),
                 path_prefix: prefix.into(),
-                upstream_url: upstream_url.into(),
+                upstream_url: upstream_url.clone(),
                 service_name: svc.into(),
                 strip_prefix: strip,
                 auth_required: auth,
@@ -185,7 +213,7 @@ impl IngressEngine {
             u_guard.entry(u_id.clone()).or_insert_with(|| {
                 Arc::new(IngressUpstreamState {
                     upstream_id: u_id,
-                    target_url: upstream_url.into(),
+                    target_url: upstream_url,
                     service_name: svc.into(),
                     health_state: Mutex::new("HEALTHY".into()),
                     latency_ms: Mutex::new(0.0),
@@ -389,6 +417,17 @@ impl IngressEngine {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
 
+        // 1. Loop detection gate: abort if recursive proxy header detected
+        if req.headers().contains_key("x-ingress-loop") {
+            return Ok(axum::response::Response::builder()
+                .status(axum::http::StatusCode::LOOP_DETECTED)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    "{\"error\":\"Loop Detected: recursive ingress proxying detected\",\"status\":508}",
+                ))
+                .unwrap_or_default());
+        }
+
         let route = match self.match_route(&path).await {
             Some(r) => r,
             None => {
@@ -401,35 +440,47 @@ impl IngressEngine {
             }
         };
 
-        // Authentication gate
+        // 2. Authentication gate: validate token with constant-time equality
         if route.auth_required {
             let auth_header = req
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok());
-            let has_bearer = auth_header
+            let presented_token = auth_header
                 .and_then(|val| {
                     val.strip_prefix("Bearer ")
                         .or_else(|| val.strip_prefix("bearer "))
                 })
-                .map(|t| !t.trim().is_empty())
-                .unwrap_or(false);
+                .map(str::trim);
 
-            if !has_bearer {
+            let expected_token = std::env::var("MUOBSERVE_BEARER_TOKEN")
+                .or_else(|_| std::env::var("MUOBSERVE_OPERATOR_TOKEN"))
+                .or_else(|_| std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN"))
+                .or_else(|_| std::env::var("MUCONDE_CD_API_TOKEN"));
+
+            let authenticated = match (presented_token, expected_token) {
+                (Some(presented), Ok(expected)) if !expected.is_empty() => {
+                    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+                }
+                _ => false,
+            };
+
+            if !authenticated {
                 return Ok(axum::response::Response::builder()
                     .status(axum::http::StatusCode::UNAUTHORIZED)
                     .header(
                         axum::http::header::WWW_AUTHENTICATE,
                         "Bearer realm=\"mu-ingress\"",
                     )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
-                        "Unauthorized: Bearer token required",
+                        "{\"error\":\"Unauthorized: valid Bearer token required\",\"status\":401}",
                     ))
                     .unwrap_or_default());
             }
         }
 
-        // Extract incoming W3C traceparent or derive root
+        // 3. Extract incoming W3C traceparent or derive root
         let incoming_parent = req
             .headers()
             .get("traceparent")
@@ -444,8 +495,8 @@ impl IngressEngine {
         };
         let upstream_child_ctx = server_ctx.next_deterministic_child(2);
 
-        // Path rewriting with base path preservation
-        let (host, port, base_path) = parse_host_port(&route.upstream_url);
+        // 4. Path rewriting with base path preservation
+        let (is_https, host, port, base_path) = parse_host_port(&route.upstream_url);
         let target_path = if route.strip_prefix {
             let stripped = path.strip_prefix(&route.path_prefix).unwrap_or(&path);
             let clean_subpath = stripped.strip_prefix('/').unwrap_or(stripped);
@@ -484,14 +535,14 @@ impl IngressEngine {
             None => target_path,
         };
 
-        // Track active connection
+        // 5. Forward request with active connection tracking
         let upstream = self
             .get_or_create_upstream(&route.upstream_url, &route.service_name)
             .await;
         upstream.active_connections.fetch_add(1, Ordering::SeqCst);
 
-        // Forward HTTP request
-        let resp_result = forward_http(host, port, &target_uri, req, &upstream_child_ctx).await;
+        let resp_result =
+            forward_http(is_https, host, port, &target_uri, req, &upstream_child_ctx).await;
         upstream.active_connections.fetch_sub(1, Ordering::SeqCst);
 
         let end_time_unix_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -499,14 +550,27 @@ impl IngressEngine {
 
         let (status_code, status_msg, resp) = match resp_result {
             Ok(r) => (r.status().as_u16(), None, r),
-            Err(e) => (
-                502,
-                Some(format!("Upstream error: {e}")),
-                axum::response::Response::builder()
-                    .status(axum::http::StatusCode::BAD_GATEWAY)
-                    .body(axum::body::Body::from(format!("Bad Gateway: {e}")))
-                    .unwrap_or_default(),
-            ),
+            Err(e) => {
+                let (status, body_msg) = if e.contains("exceeds 16MB limit") {
+                    (
+                        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                        format!("Payload Too Large: {e}"),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("Bad Gateway: Ingress error: {e}"),
+                    )
+                };
+                (
+                    status.as_u16(),
+                    Some(format!("Upstream error: {e}")),
+                    axum::response::Response::builder()
+                        .status(status)
+                        .body(axum::body::Body::from(body_msg))
+                        .unwrap_or_default(),
+                )
+            }
         };
 
         // Record OtelSpanEntry directly into HotDuckDbStore
@@ -573,7 +637,7 @@ impl UpstreamHealthChecker {
                 };
 
                 for up in upstreams {
-                    let (host, port, _) = parse_host_port(&up.target_url);
+                    let (_is_https, host, port, _) = parse_host_port(&up.target_url);
                     let start = std::time::Instant::now();
                     let success = tokio::time::timeout(
                         Duration::from_secs(2),
@@ -614,10 +678,11 @@ impl UpstreamHealthChecker {
     }
 }
 
-fn parse_host_port(target_url: &str) -> (String, u16, String) {
+fn parse_host_port(target_url: &str) -> (bool, String, u16, String) {
+    let is_https = target_url.starts_with("https://");
     let trimmed = target_url
-        .strip_prefix("http://")
-        .or_else(|| target_url.strip_prefix("https://"))
+        .strip_prefix("https://")
+        .or_else(|| target_url.strip_prefix("http://"))
         .unwrap_or(target_url);
 
     let slash_pos = trimmed.find('/');
@@ -628,38 +693,110 @@ fn parse_host_port(target_url: &str) -> (String, u16, String) {
 
     let mut parts = authority.split(':');
     let host = parts.next().unwrap_or("127.0.0.1").to_string();
+    let default_port = if is_https { 443 } else { 80 };
     let port = parts
         .next()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(80);
-    (host, port, base_path.to_string())
+        .unwrap_or(default_port);
+    (is_https, host, port, base_path.to_string())
+}
+
+fn build_ingress_tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Ok(ca_path) = std::env::var("MUOBSERVE_CA_CERT") {
+        if let Ok(ca_bytes) = std::fs::read(&ca_path) {
+            let mut cursor = std::io::Cursor::new(ca_bytes);
+            if let Ok(certs) = rustls::pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                for cert in certs {
+                    let _ = root_store.add(cert);
+                }
+            }
+        }
+    }
+
+    if root_store.is_empty() {
+        for path in &[
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+        ] {
+            if let Ok(ca_bytes) = std::fs::read(path) {
+                let mut cursor = std::io::Cursor::new(ca_bytes);
+                if let Ok(certs) = rustls::pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    for cert in certs {
+                        let _ = root_store.add(cert);
+                    }
+                    if !root_store.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client_cfg)))
 }
 
 async fn forward_http(
+    is_https: bool,
     host: String,
     port: u16,
     target_uri: &str,
     req: axum::extract::Request,
     child_ctx: &TraceContext,
 ) -> Result<axum::response::Response, String> {
-    let stream = tokio::net::TcpStream::connect((host.as_str(), port))
+    let tcp_stream = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| format!("Connect failed to {host}:{port}: {e}"))?;
 
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| format!("HTTP/1.1 handshake failed: {e}"))?;
+    let mut sender = if is_https {
+        let connector = build_ingress_tls_connector()?;
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|e| format!("Invalid TLS server name '{host}': {e}"))?;
+        let tls_stream = connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| format!("TLS connect failed to {host}:{port}: {e}"))?;
+        let io = TokioIo::new(tls_stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP/1.1 TLS handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    } else {
+        let io = TokioIo::new(tcp_stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP/1.1 plaintext handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    };
 
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+    // Bound body reading to 16MB via Limited
+    const MAX_INGRESS_BODY_BYTES: usize = 16 * 1024 * 1024;
     let (parts, body) = req.into_parts();
-    let body_bytes = body
+    let limited = http_body_util::Limited::new(body, MAX_INGRESS_BODY_BYTES);
+    let body_bytes = limited
         .collect()
         .await
-        .map_err(|e| format!("Failed to read request body: {e}"))?
+        .map_err(|e| format!("Request body exceeds 16MB limit: {e}"))?
         .to_bytes();
 
     let mut forward_req = hyper::Request::builder()
@@ -668,7 +805,7 @@ async fn forward_http(
 
     for (name, val) in parts.headers {
         if let Some(n) = name {
-            if n != hyper::header::HOST {
+            if n != hyper::header::HOST && n != "x-ingress-loop" {
                 forward_req = forward_req.header(n, val);
             }
         }
@@ -676,6 +813,7 @@ async fn forward_http(
 
     forward_req = forward_req.header(hyper::header::HOST, format!("{host}:{port}"));
     forward_req = forward_req.header("traceparent", child_ctx.to_traceparent());
+    forward_req = forward_req.header("x-ingress-loop", "1");
 
     let forward_req = forward_req
         .body(Full::new(body_bytes))
@@ -738,12 +876,20 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_with_base_path() {
-        let (host, port, base) = parse_host_port("http://127.0.0.1:8443/api/");
+        let (is_https, host, port, base) = parse_host_port("http://127.0.0.1:8443/api/");
+        assert!(!is_https);
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 8443);
         assert_eq!(base, "/api/");
 
-        let (host, port, base) = parse_host_port("http://node-a:8000");
+        let (is_https, host, port, base) = parse_host_port("https://node-a");
+        assert!(is_https);
+        assert_eq!(host, "node-a");
+        assert_eq!(port, 443);
+        assert_eq!(base, "");
+
+        let (is_https, host, port, base) = parse_host_port("http://node-a:8000");
+        assert!(!is_https);
         assert_eq!(host, "node-a");
         assert_eq!(port, 8000);
         assert_eq!(base, "");

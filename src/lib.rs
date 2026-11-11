@@ -22,12 +22,12 @@ pub const DEFAULT_HOT_RETENTION_DAYS: u32 = 7;
 pub use analytics::{
     compute_causal_problems, compute_purepath_waterfall, compute_smartscape_topology,
     compute_test_flakiness, evaluate_benchmark_regressions, evaluate_canary_slo,
-    evaluate_deterministic_problems, evaluate_regression_gate, list_trace_summaries,
-    CausalProblemCard, CausalProblemsFeedResponse, FlakyTestItem, ProblemCard, ProblemSummary,
-    ProblemsFeedResponse, PurePathLogEntry, PurePathMetricEntry, PurePathResponse,
-    PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode, SmartscapeProcessNode,
-    SmartscapeServiceNode, SmartscapeTopology, TraceListFilter, TraceListQuery, TraceListResponse,
-    TraceSummaryDto, DEFAULT_SMARTSCAPE_WINDOW_SECS,
+    evaluate_deterministic_problems, evaluate_regression_gate, generate_statistical_diagnosis,
+    list_trace_summaries, synthesize_ai_diagnosis, CausalProblemCard, CausalProblemsFeedResponse,
+    FlakyTestItem, ProblemCard, ProblemSummary, ProblemsFeedResponse, PurePathLogEntry,
+    PurePathMetricEntry, PurePathResponse, PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode,
+    SmartscapeProcessNode, SmartscapeServiceNode, SmartscapeTopology, TraceListFilter,
+    TraceListQuery, TraceListResponse, TraceSummaryDto, DEFAULT_SMARTSCAPE_WINDOW_SECS,
 };
 pub use cli::{
     execute_cli_command, migrate_actionrunner_duckdb, parse_cli_args, ActionRunnerMigrationReport,
