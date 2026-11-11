@@ -1,6 +1,6 @@
 [package]
 name = "mu-observable-hub"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Distributed OTEL + DuckDB/Parquet observability backend, centralized CI state store, hardware-aware benchmark/test regression engine, and Antigravity MCP server"
 license = "AGPL-3.0-only"
@@ -24,8 +24,8 @@ name = "mu-observable-cli"
 path = "src/bin/muobserve_cli.rs"
 
 [dependencies]
-mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
-mu-ci-isolation = { git = "https://github.com/LMA1980/mu-ci-isolation.git", branch = "feat/m8-naming-alignment" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
+mu-ci-isolation = { git = "https://github.com/LMA1980/mu-ci-isolation.git", branch = "main" }
 duckdb = { version = "=1.2.2", default-features = false }
 arrow = { version = "54", default-features = false, features = ["ipc"] }
 fory = "1.7"
@@ -37,6 +37,11 @@ rustls-pemfile = "2.2"
 rustls-pki-types = "1"
 x509-parser = "0.18"
 axum = { version = "0.8" }
+futures-core = "0.3"
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

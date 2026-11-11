@@ -267,6 +267,7 @@ pub struct HotDuckDbStore {
     dirty_writes: Arc<AtomicU64>,
     last_flush_ms: Arc<AtomicU64>,
     flush_interval_ms: u64,
+    event_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl HotDuckDbStore {
@@ -311,6 +312,7 @@ impl HotDuckDbStore {
             .map(|s| s.clamp(1, 3600) * 1000)
             .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
 
+        let (event_tx, _) = tokio::sync::broadcast::channel(2048);
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: db_path.map(Path::to_path_buf),
@@ -320,6 +322,7 @@ impl HotDuckDbStore {
             dirty_writes: Arc::new(AtomicU64::new(0)),
             last_flush_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             flush_interval_ms,
+            event_tx,
         };
         store.init_schema()?;
         store.refresh_views()?;
@@ -348,6 +351,17 @@ impl HotDuckDbStore {
     #[must_use]
     pub fn parquet_root(&self) -> Option<&Path> {
         self.parquet_root.as_deref()
+    }
+
+    /// Broadcasts an SSE event payload to active streaming subscribers.
+    pub fn broadcast_event(&self, event: &str) {
+        let _ = self.event_tx.send(event.to_string());
+    }
+
+    /// Subscribes to the live SSE event broadcast channel.
+    #[must_use]
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.event_tx.subscribe()
     }
 
     /// Updates the cold Parquet root directory and refreshes unified analytical views.

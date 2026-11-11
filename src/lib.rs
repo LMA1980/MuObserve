@@ -5,18 +5,25 @@
 pub mod analytics;
 pub mod cli;
 pub mod error;
+pub mod ingress;
 pub mod mcp;
 pub mod server;
 pub mod sql_guard;
 pub mod storage;
 
+pub use ingress::{
+    IngressEngine, IngressOverviewDto, IngressRouteDto, IngressUpstreamDto, TlsHealthDto,
+    UpstreamHealthChecker,
+};
+
 /// Default hot DuckDB retention window in days before cold Zstd Parquet compaction.
 pub const DEFAULT_HOT_RETENTION_DAYS: u32 = 7;
 
 pub use analytics::{
-    compute_purepath_waterfall, compute_smartscape_topology, compute_test_flakiness,
-    evaluate_benchmark_regressions, evaluate_canary_slo, evaluate_deterministic_problems,
-    evaluate_regression_gate, list_trace_summaries, FlakyTestItem, ProblemCard, ProblemSummary,
+    compute_causal_problems, compute_purepath_waterfall, compute_smartscape_topology,
+    compute_test_flakiness, evaluate_benchmark_regressions, evaluate_canary_slo,
+    evaluate_deterministic_problems, evaluate_regression_gate, list_trace_summaries,
+    CausalProblemCard, CausalProblemsFeedResponse, FlakyTestItem, ProblemCard, ProblemSummary,
     ProblemsFeedResponse, PurePathLogEntry, PurePathMetricEntry, PurePathResponse,
     PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode, SmartscapeProcessNode,
     SmartscapeServiceNode, SmartscapeTopology, TraceListFilter, TraceListQuery, TraceListResponse,

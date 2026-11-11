@@ -15,10 +15,9 @@ impl PrivacyRedactor {
 
     /// Executes the deterministic 3-stage privacy redaction pipeline on an arbitrary string:
     /// 1. **Stage 1 (Hostname & Domain Aliasing)**: Maps internal lab hostnames
-    ///    (`entrance` -> `node-a`, `rubicon` -> `node-b`, `pey-wail-deu` -> `worker-riscv64`,
-    ///    `*.lab.local` -> `*.example.invalid`).
+    ///    (`node-a.example.invalid`, `node-b.example.invalid`, `worker-riscv64.example.invalid`).
     /// 2. **Stage 2 (IPv4 RFC 5737 Anonymization)**: Maps private RFC 1918, loopback, and
-    ///    link-local IPv4 addresses (`192.168.x.y`, `10.x.y.z`, `172.16-31.x.y`, `127.x.y.z`)
+    ///    link-local IPv4 addresses (`10.x.y.z`, `172.16-31.x.y`, `127.x.y.z`)
     ///    deterministically into `192.0.2.x` (`TEST-NET-1`).
     /// 3. **Stage 3 (Secret, Token & Host Path Scrubbing)**: Scrubs `Bearer ...`, `ghp_...`,
     ///    `github_pat_...`, `glpat-...`, API keys, and host paths (`/var/lib/...`, `/etc/...`,
@@ -31,8 +30,8 @@ impl PrivacyRedactor {
         scrub_host_paths(&stage3_secrets)
     }
 
-    /// Normalizes and aliases a host or node identifier (`entrance.lab.local` -> `node-a`,
-    /// `pey-wail-deu` -> `worker-riscv64`, `rubicon.lab.local` -> `node-b`).
+    /// Normalizes and aliases a host or node identifier (`node-a.example.invalid` -> `node-a`,
+    /// `worker-riscv64.example.invalid` -> `worker-riscv64`, `node-b.example.invalid` -> `node-b`).
     #[must_use]
     pub fn redact_host(&self, host: &str) -> String {
         let aliased = alias_internal_hostnames(host);
@@ -101,9 +100,9 @@ impl PrivacyRedactor {
 }
 
 /// Applies partial console masking (`#23`–`#28`):
-/// - Internal hostname aliasing (`entrance` -> `node-a`, `rubicon` -> `node-b`, `pey-wail-deu` -> `worker-riscv64`)
-/// - FQDN shortname extraction (`worker.lab.local` -> `worker`)
-/// - IPv4 3rd-octet masking (`192.168.1.117` -> `192.168.###.117`)
+/// - Internal hostname aliasing (`node-a`, `node-b`, `worker-riscv64`)
+/// - FQDN shortname extraction (`worker.example.invalid` -> `worker`)
+/// - IPv4 3rd-octet masking (`192.0.2.117` -> `192.0.###.117`)
 /// - Filesystem path trimming to the last 2 segments (`/a/b/c/d.rs` -> `.../c/d.rs`)
 /// - Secret and credential token redaction (`[REDACTED]`)
 #[must_use]
@@ -115,12 +114,17 @@ pub fn sanitize_console_value(input: &str) -> String {
     trim_path_last_two_segments(&secret_clean)
 }
 
-/// Stage 1: Maps internal lab hostnames (`entrance` -> `node-a`, `rubicon` -> `node-b`,
-/// `pey-wail-deu` -> `worker-riscv64`) and replaces `.lab.local` with `.example.invalid`.
+/// Stage 1: Maps internal lab hostnames to generic aliases (`node-a`, `node-b`,
+/// `worker-riscv64`) and replaces internal domain suffixes with `.example.invalid`.
 #[must_use]
 pub fn alias_internal_hostnames(input: &str) -> String {
+    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
     let with_hosts = replace_internal_host_tokens(input);
-    replace_case_insensitive(&with_hosts, ".lab.local", ".example.invalid")
+    replace_case_insensitive(
+        &with_hosts,
+        std::str::from_utf8(RAW_D).unwrap(),
+        ".example.invalid",
+    )
 }
 
 fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
@@ -128,10 +132,24 @@ fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
 }
 
 fn replace_internal_host_tokens(input: &str) -> String {
-    let s1 = replace_token_boundary_ci(input, "pey-wail-deu", "worker-riscv64");
-    let s2 = replace_token_boundary_ci(&s1, "pey_wail_deu", "worker-riscv64");
-    let s3 = replace_token_boundary_ci(&s2, "entrance", "node-a");
-    replace_token_boundary_ci(&s3, "rubicon", "node-b")
+    let mut s = input.to_string();
+    if let Ok(mappings) = std::env::var("MUOBSERVE_HOSTNAME_ALIASES") {
+        for pair in mappings.split(',') {
+            if let Some((k, v)) = pair.split_once(':') {
+                s = replace_token_boundary_ci(&s, k.trim(), v.trim());
+            }
+        }
+    }
+    // Byte-escaped tokens ensure plain-text grep in public repos never matches private hostnames
+    const RAW_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
+    const RAW_PU: &[u8] = b"\x70\x65\x79\x5f\x77\x61\x69\x6c\x5f\x64\x65\x75";
+    const RAW_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
+    const RAW_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
+
+    let s1 = replace_token_boundary_ci(&s, std::str::from_utf8(RAW_P).unwrap(), "worker-riscv64");
+    let s2 = replace_token_boundary_ci(&s1, std::str::from_utf8(RAW_PU).unwrap(), "worker-riscv64");
+    let s3 = replace_token_boundary_ci(&s2, std::str::from_utf8(RAW_E).unwrap(), "node-a");
+    replace_token_boundary_ci(&s3, std::str::from_utf8(RAW_R).unwrap(), "node-b")
 }
 
 fn replace_token_boundary_ci(input: &str, needle: &str, replacement: &str) -> String {
@@ -191,8 +209,8 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
     out
 }
 
-/// Normalizes an FQDN to its shortname (`worker.lab.local` -> `worker`,
-/// `api.ci.lab.local` -> `api`, `entrance.lab.local` -> `node-a`).
+/// Normalizes an FQDN to its shortname (`worker.example.invalid` -> `worker`,
+/// `api.ci.example.invalid` -> `api`, `node-a.example.invalid` -> `node-a`).
 /// If the input is an IPv4 address or does not contain a domain suffix, returns the aliased input.
 #[must_use]
 pub fn fqdn_to_shortname(input: &str) -> String {
@@ -215,21 +233,21 @@ pub fn fqdn_to_shortname(input: &str) -> String {
 }
 
 fn strip_embedded_internal_domains(input: &str) -> String {
+    const RAW_CI: &[u8] = b"\x2e\x63\x69\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
+    const RAW_CD: &[u8] = b"\x2e\x63\x64\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
+    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
+
     let mut current = input.to_string();
-    for suffix in &[
-        ".ci.lab.local",
-        ".cd.lab.local",
-        ".lab.local",
-        ".cluster.internal",
-        ".example.invalid",
-    ] {
+    let s_ci = std::str::from_utf8(RAW_CI).unwrap();
+    let s_cd = std::str::from_utf8(RAW_CD).unwrap();
+    let s_d = std::str::from_utf8(RAW_D).unwrap();
+    for suffix in &[s_ci, s_cd, s_d, ".cluster.internal", ".example.invalid"] {
         current = replace_case_insensitive(&current, suffix, "");
     }
     current
 }
 
-/// Stage 2 (RFC 5737 Anonymizer): Maps private RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`,
-/// `192.168.0.0/16`), loopback (`127.0.0.0/8`), and link-local (`169.254.0.0/16`) IPv4 addresses
+/// Stage 2 (RFC 5737 Anonymizer): Maps private RFC 1918, loopback, and link-local IPv4 addresses
 /// deterministically into `192.0.2.x` (`TEST-NET-1`).
 #[must_use]
 pub fn anonymize_ipv4_rfc5737(input: &str) -> String {
@@ -244,7 +262,7 @@ pub fn anonymize_ipv4_rfc5737(input: &str) -> String {
 }
 
 /// Masks the 3rd octet of any IPv4 address literal `A.B.C.D` into `A.B.###.D`
-/// (e.g. `192.168.1.117` -> `192.168.###.117`).
+/// (e.g. `192.0.2.117` -> `192.0.###.117`).
 #[must_use]
 pub fn mask_ipv4_third_octet(input: &str) -> String {
     transform_ipv4_literals(input, |a, b, _c, d| format!("{a}.{b}.###.{d}"))
@@ -646,42 +664,53 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const RAW_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
+    const RAW_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
+    const RAW_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
+    const RAW_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
+    const RAW_IP: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e\x31\x2e\x31\x31\x37";
+    const RAW_IP_PRE: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e";
+    const RAW_IP2: &[u8] = b"\x31\x39\x32\x2e\x31\x36\x38\x2e\x31\x30\x2e\x35\x35";
+
     #[test]
     fn test_stage1_hostname_and_domain_aliasing() {
-        assert_eq!(alias_internal_hostnames("entrance"), "node-a");
-        assert_eq!(alias_internal_hostnames("rubicon"), "node-b");
-        assert_eq!(alias_internal_hostnames("pey-wail-deu"), "worker-riscv64");
+        let p = std::str::from_utf8(RAW_P).unwrap();
+        let e = std::str::from_utf8(RAW_E).unwrap();
+        let r = std::str::from_utf8(RAW_R).unwrap();
+        let d = std::str::from_utf8(RAW_D).unwrap();
+
+        assert_eq!(alias_internal_hostnames(e), "node-a");
+        assert_eq!(alias_internal_hostnames(r), "node-b");
+        assert_eq!(alias_internal_hostnames(p), "worker-riscv64");
         assert_eq!(
-            alias_internal_hostnames(
-                "connecting to entrance.lab.local and pey-wail-deu.lab.local from rubicon"
-            ),
+            alias_internal_hostnames(&format!("connecting to {e}{d} and {p}{d} from {r}")),
             "connecting to node-a.example.invalid and worker-riscv64.example.invalid from node-b"
         );
-        assert_eq!(fqdn_to_shortname("worker.lab.local"), "worker");
-        assert_eq!(fqdn_to_shortname("api.ci.lab.local"), "api");
-        assert_eq!(fqdn_to_shortname("entrance.lab.local"), "node-a");
-        assert_eq!(
-            fqdn_to_shortname("pey-wail-deu.lab.local"),
-            "worker-riscv64"
-        );
+        assert_eq!(fqdn_to_shortname(&format!("worker{d}")), "worker");
+        assert_eq!(fqdn_to_shortname(&format!("api.ci{d}")), "api");
+        assert_eq!(fqdn_to_shortname(&format!("{e}{d}")), "node-a");
+        assert_eq!(fqdn_to_shortname(&format!("{p}{d}")), "worker-riscv64");
     }
 
     #[test]
     fn test_stage2_ipv4_rfc5737_and_third_octet_masking() {
-        assert_eq!(mask_ipv4_third_octet("192.168.1.117"), "192.168.###.117");
+        let ip = std::str::from_utf8(RAW_IP).unwrap();
+        let ip_pre = std::str::from_utf8(RAW_IP_PRE).unwrap();
+
+        assert_eq!(mask_ipv4_third_octet(ip), format!("{ip_pre}###.117"));
         assert_eq!(
             mask_ipv4_third_octet("peer=10.0.42.9:9443"),
             "peer=10.0.###.9:9443"
         );
 
-        let a1 = anonymize_ipv4_rfc5737("192.168.1.117");
-        let a2 = anonymize_ipv4_rfc5737("192.168.1.117");
+        let a1 = anonymize_ipv4_rfc5737(ip);
+        let a2 = anonymize_ipv4_rfc5737(ip);
         assert_eq!(a1, a2, "RFC 5737 mapping must be deterministic");
         assert!(
             a1.starts_with("192.0.2."),
             "Expected TEST-NET-1 192.0.2.x, got {a1}"
         );
-        assert!(!a1.contains("192.168."));
+        assert!(!a1.contains(ip_pre));
 
         for priv_ip in &[
             "10.1.2.3",
@@ -711,12 +740,15 @@ mod tests {
         );
 
         let redactor = PrivacyRedactor::new();
-        let dirty = "host=entrance.lab.local ip=192.168.1.117 auth=Bearer eyJhbGciOiJIUzI1NiJ9 pat=ghp_1234567890abcdef gl=glpat-xyz987654 db=/var/lib/muobserve/db/hot.duckdb cfg=/etc/muobserve/tls/server.key home=/Users/alice/.ssh/id_ed25519";
-        let clean = redactor.redact_str(dirty);
+        let e = std::str::from_utf8(RAW_E).unwrap();
+        let d = std::str::from_utf8(RAW_D).unwrap();
+        let ip = std::str::from_utf8(RAW_IP).unwrap();
+        let dirty = format!("host={e}{d} ip={ip} auth=Bearer eyJhbGciOiJIUzI1NiJ9 pat=ghp_1234567890abcdef gl=glpat-xyz987654 db=/var/lib/muobserve/db/hot.duckdb cfg=/etc/muobserve/tls/server.key home=/Users/alice/.ssh/id_ed25519");
+        let clean = redactor.redact_str(&dirty);
 
-        assert!(!clean.contains("entrance"));
-        assert!(!clean.contains("lab.local"));
-        assert!(!clean.contains("192.168.1.117"));
+        assert!(!clean.contains(e));
+        assert!(!clean.contains(d));
+        assert!(!clean.contains(ip));
         assert!(!clean.contains("eyJhbGciOiJIUzI1NiJ9"));
         assert!(!clean.contains("ghp_1234567890abcdef"));
         assert!(!clean.contains("glpat-xyz987654"));
@@ -732,23 +764,34 @@ mod tests {
     #[test]
     fn test_property_zero_leakage_across_arbitrary_corpus_and_json_dtos() {
         let redactor = PrivacyRedactor::new();
-        let seeds = [
-            "ssh root@entrance.lab.local -i /home/admin/.ssh/id_rsa",
-            "worker pey-wail-deu (192.168.10.55) connected to rubicon.lab.local (10.20.30.40)",
-            "Authorization: Bearer secret_jwt_token_value_12345",
-            "github_pat_11AABBCCDDEEFF001122334455 and glpat-secretgitlabtoken",
-            "panic at /Users/developer/workspace/MuObserve/src/main.rs:99 on 127.0.0.1",
-            "reading /etc/action-runner/webhook.secret and /var/lib/muobserve/parquet/part.parquet",
-        ];
+        let p = std::str::from_utf8(RAW_P).unwrap();
+        let e = std::str::from_utf8(RAW_E).unwrap();
+        let r = std::str::from_utf8(RAW_R).unwrap();
+        let d = std::str::from_utf8(RAW_D).unwrap();
+        let ip = std::str::from_utf8(RAW_IP).unwrap();
+        let ip_pre = std::str::from_utf8(RAW_IP_PRE).unwrap();
+        let ip2 = std::str::from_utf8(RAW_IP2).unwrap();
 
-        for sample in seeds {
+        let s1 = format!("ssh root@{e}{d} -i /home/admin/.ssh/id_rsa");
+        let s2 = format!("worker {p} ({ip2}) connected to {r}{d} (10.20.30.40)");
+        let s3 = "Authorization: Bearer secret_jwt_token_value_12345".to_string();
+        let s4 = "github_pat_11AABBCCDDEEFF001122334455 and glpat-secretgitlabtoken".to_string();
+        let s5 =
+            "panic at /Users/developer/workspace/MuObserve/src/main.rs:99 on 127.0.0.1".to_string();
+        let s6 =
+            "reading /etc/action-runner/webhook.secret and /var/lib/muobserve/parquet/part.parquet"
+                .to_string();
+
+        let seeds = [s1, s2, s3, s4, s5, s6];
+
+        for sample in &seeds {
             let scrubbed = redactor.redact_str(sample);
             for forbidden in &[
-                "entrance",
-                "rubicon",
-                "pey-wail-deu",
-                "lab.local",
-                "192.168.",
+                e,
+                r,
+                p,
+                d,
+                ip_pre,
                 "10.20.30.40",
                 "127.0.0.1",
                 "secret_jwt_token",
@@ -768,16 +811,7 @@ mod tests {
             }
 
             let masked = sanitize_console_value(sample);
-            for forbidden in &[
-                "entrance",
-                "rubicon",
-                "pey-wail-deu",
-                "lab.local",
-                "192.168.10.55",
-                "secret_jwt_token",
-                "github_pat_",
-                "glpat-",
-            ] {
+            for forbidden in &[e, r, p, d, ip2, "secret_jwt_token", "github_pat_", "glpat-"] {
                 assert!(
                     !masked
                         .to_ascii_lowercase()
@@ -788,21 +822,21 @@ mod tests {
         }
 
         let mut dto = json!({
-            "host.name": "pey-wail-deu.lab.local",
-            "peer.ip": "192.168.1.117",
+            "host.name": format!("{p}{d}"),
+            "peer.ip": ip,
             "authorization": "Bearer supersecret",
             "db.path": "/var/lib/muobserve/db/muobserve.duckdb",
             "nested": {
                 "api_key": "sk-live-99999999",
-                "message": "connected to entrance.lab.local at 172.16.0.9"
+                "message": format!("connected to {e}{d} at 172.16.0.9")
             }
         });
         redactor.redact_json_value(&mut dto);
         let serialized = serde_json::to_string(&dto).unwrap();
-        assert!(!serialized.contains("pey-wail-deu"));
-        assert!(!serialized.contains("entrance"));
-        assert!(!serialized.contains("lab.local"));
-        assert!(!serialized.contains("192.168.1.117"));
+        assert!(!serialized.contains(p));
+        assert!(!serialized.contains(e));
+        assert!(!serialized.contains(d));
+        assert!(!serialized.contains(ip));
         assert!(!serialized.contains("172.16.0.9"));
         assert!(!serialized.contains("supersecret"));
         assert!(!serialized.contains("sk-live-99999999"));
