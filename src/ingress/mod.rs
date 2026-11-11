@@ -625,8 +625,27 @@ impl IngressEngine {
 pub struct UpstreamHealthChecker;
 
 impl UpstreamHealthChecker {
-    /// Spawns a background task monitoring upstreams on `interval`.
+    /// Spawns a background task monitoring upstreams on `interval` with default probe timeout.
     pub fn spawn(engine: Arc<IngressEngine>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let default_timeout = if interval < Duration::from_secs(1) {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
+        let probe_timeout = std::env::var("MUOBSERVE_UPSTREAM_PROBE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(default_timeout);
+        Self::spawn_with_timeout(engine, interval, probe_timeout)
+    }
+
+    /// Spawns a background task monitoring upstreams on `interval` with explicit `probe_timeout`.
+    pub fn spawn_with_timeout(
+        engine: Arc<IngressEngine>,
+        interval: Duration,
+        probe_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
@@ -636,11 +655,11 @@ impl UpstreamHealthChecker {
                     map.values().cloned().collect()
                 };
 
-                for up in upstreams {
+                let probe_futures = upstreams.into_iter().map(|up| async move {
                     let (_is_https, host, port, _) = parse_host_port(&up.target_url);
                     let start = std::time::Instant::now();
                     let success = tokio::time::timeout(
-                        Duration::from_secs(2),
+                        probe_timeout,
                         tokio::net::TcpStream::connect((host.as_str(), port)),
                     )
                     .await
@@ -672,7 +691,9 @@ impl UpstreamHealthChecker {
                     }
                     up.last_check_ms
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-                }
+                });
+
+                futures_util::future::join_all(probe_futures).await;
             }
         })
     }
@@ -691,13 +712,43 @@ fn parse_host_port(target_url: &str) -> (bool, String, u16, String) {
         None => (trimmed, ""),
     };
 
-    let mut parts = authority.split(':');
-    let host = parts.next().unwrap_or("127.0.0.1").to_string();
+    let authority = match authority.rfind('@') {
+        Some(pos) => &authority[pos + 1..],
+        None => authority,
+    };
+
     let default_port = if is_https { 443 } else { 80 };
-    let port = parts
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(default_port);
+
+    let (host, port) = if authority.starts_with('[') {
+        if let Some(close_idx) = authority.find(']') {
+            let h = &authority[1..close_idx];
+            let remainder = &authority[close_idx + 1..];
+            let p = if let Some(port_str) = remainder.strip_prefix(':') {
+                port_str.parse::<u16>().unwrap_or(default_port)
+            } else {
+                default_port
+            };
+            (h.to_string(), p)
+        } else {
+            let clean = authority.trim_matches(|c| c == '[' || c == ']');
+            (clean.to_string(), default_port)
+        }
+    } else {
+        let mut parts = authority.split(':');
+        let h = parts.next().unwrap_or("127.0.0.1").to_string();
+        let p = parts
+            .next()
+            .and_then(|part| part.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        (h, p)
+    };
+
+    let host = if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+
     (is_https, host, port, base_path.to_string())
 }
 
@@ -811,7 +862,12 @@ async fn forward_http(
         }
     }
 
-    forward_req = forward_req.header(hyper::header::HOST, format!("{host}:{port}"));
+    let host_header = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    forward_req = forward_req.header(hyper::header::HOST, host_header);
     forward_req = forward_req.header("traceparent", child_ctx.to_traceparent());
     forward_req = forward_req.header("x-ingress-loop", "1");
 
@@ -892,6 +948,18 @@ mod tests {
         assert!(!is_https);
         assert_eq!(host, "node-a");
         assert_eq!(port, 8000);
+        assert_eq!(base, "");
+
+        let (is_https, host, port, base) = parse_host_port("http://[::1]:8080/api/");
+        assert!(!is_https);
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+        assert_eq!(base, "/api/");
+
+        let (is_https, host, port, base) = parse_host_port("https://[2001:db8::1]:8443");
+        assert!(is_https);
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 8443);
         assert_eq!(base, "");
     }
 }

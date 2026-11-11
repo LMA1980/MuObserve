@@ -789,6 +789,22 @@ async fn test_empirical_ingress_upstream_health_state_transitions() {
     let store = HotDuckDbStore::open_in_memory().expect("open HotDuckDbStore");
     let engine = IngressEngine::new(store.clone(), "test-node-ingress".into());
 
+    // Allocate a guaranteed closed ephemeral port on loopback for deterministic failure
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    };
+    engine.add_route(
+        "route-dummy-unreachable",
+        "/api/unreachable/",
+        &format!("http://127.0.0.1:{closed_port}/api/"),
+        "dummy-unreachable",
+        true,
+        false,
+    );
+
     let upstreams = engine.get_upstream_dtos().await;
     let initial_reg = upstreams
         .iter()
@@ -796,11 +812,21 @@ async fn test_empirical_ingress_upstream_health_state_transitions() {
         .expect("muregist upstream");
     assert_eq!(initial_reg.health_state, "HEALTHY"); // Initially HEALTHY
 
-    // Spawn UpstreamHealthChecker with 50ms probe interval
-    let handle = UpstreamHealthChecker::spawn(engine.clone(), Duration::from_millis(50));
+    let initial_dummy = upstreams
+        .iter()
+        .find(|u| u.service_name == "dummy-unreachable")
+        .expect("dummy-unreachable upstream");
+    assert_eq!(initial_dummy.health_state, "HEALTHY"); // Initially HEALTHY
 
-    // Allow multiple sweeps to run (giving 2.5s for 2s timeout on 192.0.2.10 plus local refused connects)
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Spawn UpstreamHealthChecker with 50ms probe interval and bounded 200ms probe timeout
+    let handle = UpstreamHealthChecker::spawn_with_timeout(
+        engine.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+    );
+
+    // Allow multiple sweeps to run (>=3 sweeps for UNHEALTHY: 3 * 50ms = 150ms; sleep 600ms)
+    tokio::time::sleep(Duration::from_millis(600)).await;
     handle.abort();
 
     let updated_upstreams = engine.get_upstream_dtos().await;
@@ -817,6 +843,16 @@ async fn test_empirical_ingress_upstream_health_state_transitions() {
             .iter()
             .map(|u| (&u.service_name, &u.health_state))
             .collect::<Vec<_>>()
+    );
+
+    // Explicitly verify the registered dummy upstream transitioned to UNHEALTHY
+    let dummy_upstream = updated_upstreams
+        .iter()
+        .find(|u| u.service_name == "dummy-unreachable")
+        .expect("dummy upstream present");
+    assert_eq!(
+        dummy_upstream.health_state, "UNHEALTHY",
+        "dummy-unreachable should transition to UNHEALTHY after consecutive failures"
     );
 }
 

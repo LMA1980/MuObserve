@@ -589,14 +589,46 @@ fn validate_upstream_url_ssrf(url_str: &str) -> Result<(), &'static str> {
         None => trimmed,
     };
 
-    let host = match authority.rfind('@') {
+    let host_port = match authority.rfind('@') {
         Some(pos) => &authority[pos + 1..],
         None => authority,
     };
 
-    let host = match host.find(':') {
-        Some(pos) => &host[..pos],
-        None => host,
+    let host = if host_port.starts_with('[') {
+        let close_bracket = match host_port.find(']') {
+            Some(pos) => pos,
+            None => return Err("Malformed IPv6 host: missing closing bracket"),
+        };
+        let raw_host = &host_port[1..close_bracket];
+        let remainder = &host_port[close_bracket + 1..];
+        if !remainder.is_empty() {
+            if let Some(port_str) = remainder.strip_prefix(':') {
+                if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                    return Err("Invalid port in upstream URL");
+                }
+            } else {
+                return Err("Malformed authority: trailing characters after IPv6 bracket");
+            }
+        }
+        raw_host
+    } else {
+        if host_port.chars().filter(|&c| c == ':').count() >= 2 {
+            if let Ok(std::net::IpAddr::V6(ipv6)) = host_port.parse::<std::net::IpAddr>() {
+                if ipv6.is_unspecified() || ipv6.is_unicast_link_local() {
+                    return Err("SSRF blocked: IPv6 address is link-local or unspecified");
+                }
+            }
+            return Err("Malformed IPv6 host: IPv6 addresses must be bracketed in URLs");
+        }
+        if let Some(pos) = host_port.find(':') {
+            let port_str = &host_port[pos + 1..];
+            if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                return Err("Invalid port in upstream URL");
+            }
+            &host_port[..pos]
+        } else {
+            host_port
+        }
     };
 
     let host = host.trim_matches(|c| c == '[' || c == ']');
@@ -629,8 +661,21 @@ fn validate_upstream_url_ssrf(url_str: &str) -> Result<(), &'static str> {
                 if ipv6.is_unspecified() || ipv6.is_unicast_link_local() {
                     return Err("SSRF blocked: IPv6 address is link-local or unspecified");
                 }
+                if let Some(v4) = ipv6.to_ipv4() {
+                    if v4.is_link_local()
+                        || v4.is_unspecified()
+                        || v4.is_broadcast()
+                        || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+                    {
+                        return Err(
+                            "SSRF blocked: IPv4-mapped IPv6 address is link-local, unspecified, or metadata",
+                        );
+                    }
+                }
             }
         }
+    } else if host_port.starts_with('[') {
+        return Err("Malformed IPv6 host: not a valid IPv6 address");
     }
 
     Ok(())
