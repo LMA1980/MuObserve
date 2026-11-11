@@ -795,15 +795,16 @@ impl HotDuckDbStore {
 
         if count > 0 {
             self.record_write_and_maybe_flush();
+            let redactor = PrivacyRedactor::new();
             for item in expanded.iter().take(100) {
                 let ev = serde_json::json!({
                     "log_entry": true,
                     "timestamp_ms": (item.entry.timestamp_unix_nano / 1_000_000) as u64,
                     "severity": item.entry.severity_text,
-                    "service": item.entry.service_name,
+                    "service": redactor.redact_str(&item.entry.service_name),
                     "trace_id": item.entry.trace_id,
                     "span_id": if item.entry.span_id.is_empty() { None } else { Some(&item.entry.span_id) },
-                    "message": item.entry.body,
+                    "message": redactor.redact_str(&item.entry.body),
                 });
                 if let Ok(payload) = serde_json::to_string(&ev) {
                     self.broadcast_event(&payload);
