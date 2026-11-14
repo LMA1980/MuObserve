@@ -98,67 +98,113 @@ pub fn compute_log_dedup_hash(
     }
 }
 
-/// Extracts normalized lowercase tokens (`len >= 2`, splitting on non-alphanumeric characters
-/// except `_`, `-`, `.`, `/`, up to 32 unique tokens per line) from `line_body`, `service_name`,
-/// `node_id`, `job_id`, and `stage_id`.
+fn is_valid_index_token(token: &str) -> bool {
+    token.len() >= 2
+        && (token.bytes().any(|b| b.is_ascii_alphanumeric())
+            || matches!(token, "<=" | ">=" | "<>" | "=="))
+}
+
+fn push_unique_token(
+    token: String,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_tokens: Option<usize>,
+) {
+    if max_tokens.is_some_and(|cap| out.len() >= cap) {
+        return;
+    }
+    if seen.insert(token.clone()) {
+        out.push(token);
+    }
+}
+
+fn tokenize_text_into(
+    text: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_tokens: Option<usize>,
+) {
+    for raw in text.split(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '<' | '>' | '='))
+    }) {
+        if max_tokens.is_some_and(|cap| out.len() >= cap) {
+            break;
+        }
+        let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
+        if !is_valid_index_token(trimmed) {
+            continue;
+        }
+        push_unique_token(trimmed.to_ascii_lowercase(), seen, out, max_tokens);
+    }
+}
+
+/// Extracts normalized lowercase tokens (`len >= 2`, preserving comparison operators
+/// `<`, `>`, `=`, and splitting on non-alphanumeric characters except `_`, `-`, `.`, `/`, `<`,
+/// `>`, `=`, up to 32 unique tokens per line) from `line_body`, `service_name`, `node_id`,
+/// `job_id`, and `stage_id`.
 #[must_use]
 pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
     let mut seen = HashSet::with_capacity(MAX_TOKENS_PER_LINE);
     let mut out = Vec::with_capacity(MAX_TOKENS_PER_LINE);
 
-    let mut push_tokens = |text: &str| {
-        for raw in text.split(|c: char| {
-            !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '<' | '>'))
-        }) {
-            if out.len() >= MAX_TOKENS_PER_LINE {
-                break;
-            }
-            let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
-            if trimmed.len() < 2
-                || !trimmed
-                    .bytes()
-                    .any(|b| b.is_ascii_alphanumeric() || matches!(b, b'<' | b'>'))
-            {
-                continue;
-            }
-            let lower = trimmed.to_ascii_lowercase();
-            if seen.insert(lower.clone()) {
-                out.push(lower);
-            }
-        }
-    };
-
-    push_tokens(line_body);
-    push_tokens(&entry.service_name);
-    push_tokens(&entry.node_id);
+    tokenize_text_into(line_body, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
+    tokenize_text_into(
+        &entry.service_name,
+        &mut seen,
+        &mut out,
+        Some(MAX_TOKENS_PER_LINE),
+    );
+    tokenize_text_into(
+        &entry.node_id,
+        &mut seen,
+        &mut out,
+        Some(MAX_TOKENS_PER_LINE),
+    );
     if let Some(jid) = entry.job_id.as_deref() {
-        push_tokens(jid);
+        tokenize_text_into(jid, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
     }
     if let Some(sid) = entry.stage_id.as_deref() {
-        push_tokens(sid);
+        tokenize_text_into(sid, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
     }
+
+    // Also index comparator-led suffixes (`<=5`, `>=100`, `=5`) and sub-words (`status`, `failed`)
+    // for compound tokens such as `count<=5` or `status=failed`.
+    let primary_snapshot = out.clone();
+    for primary in &primary_snapshot {
+        if out.len() >= MAX_TOKENS_PER_LINE {
+            break;
+        }
+        if let Some(op_idx) = primary.find(['<', '>', '=']) {
+            let op_suffix = &primary[op_idx..];
+            if is_valid_index_token(op_suffix) {
+                push_unique_token(
+                    op_suffix.to_string(),
+                    &mut seen,
+                    &mut out,
+                    Some(MAX_TOKENS_PER_LINE),
+                );
+            }
+            for sub in primary.split(['<', '>', '=']) {
+                let clean = sub.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
+                if is_valid_index_token(clean) {
+                    push_unique_token(
+                        clean.to_string(),
+                        &mut seen,
+                        &mut out,
+                        Some(MAX_TOKENS_PER_LINE),
+                    );
+                }
+            }
+        }
+    }
+
     out
 }
 
 fn tokenize_query_text(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for raw in query.split(|c: char| {
-        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '<' | '>'))
-    }) {
-        let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | '-' | '/'));
-        if trimmed.len() < 2
-            || !trimmed
-                .bytes()
-                .any(|b| b.is_ascii_alphanumeric() || matches!(b, b'<' | b'>'))
-        {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if seen.insert(lower.clone()) {
-            out.push(lower);
-        }
-    }
+    tokenize_text_into(query, &mut seen, &mut out, None);
     out
 }
 
@@ -891,6 +937,24 @@ impl HotDuckDbStore {
         job_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SanitizedLogRecord>, StorageError> {
+        self.search_logs_by_token_filtered(token_query, None, None, None, job_id, None, None, limit)
+    }
+
+    /// Searches logs via the OpenSearch-style inverted token index (`log_inverted_index`) with
+    /// full SQL predicate pushdown (`trace_id`, `job_id`, `sev_range`, case-insensitive `service`,
+    /// and `from_ns`/`to_ns` timestamp bounds) applied before `ORDER BY ... LIMIT`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_logs_by_token_filtered(
+        &self,
+        token_query: &str,
+        sev_range: Option<(i32, i32, &str)>,
+        service_filter: Option<&str>,
+        trace_id_filter: Option<&str>,
+        job_id: Option<&str>,
+        from_ns: Option<i64>,
+        to_ns: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SanitizedLogRecord>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -909,11 +973,14 @@ impl HotDuckDbStore {
         }
 
         let matched_hashes_vec: Vec<u64> = matched_hashes.into_iter().collect();
-        let placeholders = (2..=matched_hashes_vec.len() + 1)
+        let (min_sev, max_sev, sev_text) = match sev_range {
+            Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
+            None => (None, None, None),
+        };
+        let placeholders = (10..=matched_hashes_vec.len() + 9)
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let limit_idx = matched_hashes_vec.len() + 2;
 
         let sql = format!(
             r#"
@@ -922,21 +989,33 @@ impl HotDuckDbStore {
                 service_name, node_id, body, attributes_json, job_id, stage_id,
                 COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
             FROM v_logs
-            WHERE (?1 IS NULL OR job_id = ?1)
+            WHERE (?1 IS NULL OR trace_id = ?1)
+              AND (?2 IS NULL OR job_id = ?2)
+              AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?5 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?5 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
+              AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
+              AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
+              AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
               AND dedup_hash IN ({placeholders})
             ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
-            LIMIT ?{limit_idx}
+            LIMIT ?9
             "#
         );
 
         let lim = bounded_limit as i64;
         let mut param_refs: Vec<&dyn duckdb::types::ToSql> =
-            Vec::with_capacity(matched_hashes_vec.len() + 2);
+            Vec::with_capacity(matched_hashes_vec.len() + 9);
+        param_refs.push(&trace_id_filter);
         param_refs.push(&job_id);
+        param_refs.push(&min_sev);
+        param_refs.push(&max_sev);
+        param_refs.push(&sev_text);
+        param_refs.push(&service_filter);
+        param_refs.push(&from_ns);
+        param_refs.push(&to_ns);
+        param_refs.push(&lim);
         for h in &matched_hashes_vec {
             param_refs.push(h);
         }
-        param_refs.push(&lim);
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(&param_refs[..], |r| {

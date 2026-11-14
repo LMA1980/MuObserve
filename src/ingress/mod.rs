@@ -104,6 +104,14 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Reads a trimmed non-empty string from an environment variable.
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Central Ingress Reverse-Proxy Engine.
 pub struct IngressEngine {
     store: HotDuckDbStore,
@@ -273,13 +281,29 @@ impl IngressEngine {
         );
     }
 
-    /// Matches a request path against registered ingress routes using longest prefix matching.
+    /// Matches a request path against registered ingress routes using segment-boundary
+    /// longest prefix matching (`norm == path` or next character is `'/'`).
     pub async fn match_route(&self, path: &str) -> Option<Arc<IngressRouteState>> {
         let routes = self.routes.read().unwrap();
         routes
             .iter()
-            .filter(|r| path.starts_with(&r.path_prefix))
-            .max_by_key(|r| r.path_prefix.len())
+            .filter(|r| {
+                let norm = r.path_prefix.trim_end_matches('/');
+                if norm.is_empty() {
+                    path.starts_with('/')
+                } else {
+                    path == norm
+                        || path
+                            .strip_prefix(norm)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                }
+            })
+            .max_by_key(|r| {
+                (
+                    r.path_prefix.trim_end_matches('/').len(),
+                    r.path_prefix.len(),
+                )
+            })
             .cloned()
     }
 
@@ -453,13 +477,13 @@ impl IngressEngine {
                 })
                 .map(str::trim);
 
-            let expected_token = std::env::var("MUOBSERVE_BEARER_TOKEN")
-                .or_else(|_| std::env::var("MUOBSERVE_OPERATOR_TOKEN"))
-                .or_else(|_| std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN"))
-                .or_else(|_| std::env::var("MUCONDE_CD_API_TOKEN"));
+            let expected_token = non_empty_env("MUOBSERVE_BEARER_TOKEN")
+                .or_else(|| non_empty_env("MUOBSERVE_OPERATOR_TOKEN"))
+                .or_else(|| non_empty_env("MUOBSERVE_INGRESS_ADMIN_TOKEN"))
+                .or_else(|| non_empty_env("MUCONDE_CD_API_TOKEN"));
 
             let authenticated = match (presented_token, expected_token) {
-                (Some(presented), Ok(expected)) if !expected.is_empty() => {
+                (Some(presented), Some(expected)) => {
                     constant_time_eq(presented.as_bytes(), expected.as_bytes())
                 }
                 _ => false,
@@ -498,7 +522,12 @@ impl IngressEngine {
         // 4. Path rewriting with base path preservation
         let (is_https, host, port, base_path) = parse_host_port(&route.upstream_url);
         let target_path = if route.strip_prefix {
-            let stripped = path.strip_prefix(&route.path_prefix).unwrap_or(&path);
+            let norm_prefix = route.path_prefix.trim_end_matches('/');
+            let stripped = if norm_prefix.is_empty() {
+                path.as_str()
+            } else {
+                path.strip_prefix(norm_prefix).unwrap_or(&path)
+            };
             let clean_subpath = stripped.strip_prefix('/').unwrap_or(stripped);
             if base_path.is_empty() || base_path == "/" {
                 format!("/{clean_subpath}")

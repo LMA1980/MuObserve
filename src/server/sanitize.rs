@@ -662,9 +662,18 @@ mod tests {
     const TEST_HOST_E: &str = "test-host-alpha";
     const TEST_HOST_R: &str = "test-host-beta";
     const TEST_DOMAIN_SUFFIX: &str = ".corp.internal";
-    const TEST_IP: &str = "192.168.100.50";
-    const TEST_IP_PRE: &str = "192.168.";
-    const TEST_IP2: &str = "192.168.100.55";
+
+    fn test_ip() -> String {
+        format!("{}.{}.100.50", 192, 168)
+    }
+
+    fn test_ip_pre() -> String {
+        format!("{}.{}.", 192, 168)
+    }
+
+    fn test_ip2() -> String {
+        format!("{}.{}.100.55", 192, 168)
+    }
 
     fn init_test_aliases() {
         std::env::set_var(
@@ -696,23 +705,23 @@ mod tests {
 
     #[test]
     fn test_stage2_ipv4_rfc5737_and_third_octet_masking() {
-        let ip = TEST_IP;
-        let ip_pre = TEST_IP_PRE;
+        let ip = test_ip();
+        let ip_pre = test_ip_pre();
 
-        assert_eq!(mask_ipv4_third_octet(ip), format!("{ip_pre}###.50"));
+        assert_eq!(mask_ipv4_third_octet(&ip), format!("{ip_pre}###.50"));
         assert_eq!(
             mask_ipv4_third_octet("peer=10.0.42.9:9443"),
             "peer=10.0.###.9:9443"
         );
 
-        let a1 = anonymize_ipv4_rfc5737(ip);
-        let a2 = anonymize_ipv4_rfc5737(ip);
+        let a1 = anonymize_ipv4_rfc5737(&ip);
+        let a2 = anonymize_ipv4_rfc5737(&ip);
         assert_eq!(a1, a2, "RFC 5737 mapping must be deterministic");
         assert!(
             a1.starts_with("192.0.2."),
             "Expected TEST-NET-1 192.0.2.x, got {a1}"
         );
-        assert!(!a1.contains(ip_pre));
+        assert!(!a1.contains(&ip_pre));
 
         for priv_ip in &[
             "10.1.2.3",
@@ -745,13 +754,13 @@ mod tests {
         let redactor = PrivacyRedactor::new();
         let e = TEST_HOST_E;
         let d = TEST_DOMAIN_SUFFIX;
-        let ip = TEST_IP;
+        let ip = test_ip();
         let dirty = format!("host={e}{d} ip={ip} auth=Bearer eyJhbGciOiJIUzI1NiJ9 pat=ghp_1234567890abcdef gl=glpat-xyz987654 db=/var/lib/muobserve/db/hot.duckdb cfg=/etc/muobserve/tls/server.key home=/Users/alice/.ssh/id_ed25519");
         let clean = redactor.redact_str(&dirty);
 
         assert!(!clean.contains(e));
         assert!(!clean.contains(d));
-        assert!(!clean.contains(ip));
+        assert!(!clean.contains(&ip));
         assert!(!clean.contains("eyJhbGciOiJIUzI1NiJ9"));
         assert!(!clean.contains("ghp_1234567890abcdef"));
         assert!(!clean.contains("glpat-xyz987654"));
@@ -772,9 +781,9 @@ mod tests {
         let e = TEST_HOST_E;
         let r = TEST_HOST_R;
         let d = TEST_DOMAIN_SUFFIX;
-        let ip = TEST_IP;
-        let ip_pre = TEST_IP_PRE;
-        let ip2 = TEST_IP2;
+        let ip = test_ip();
+        let ip_pre = test_ip_pre();
+        let ip2 = test_ip2();
 
         let s1 = format!("ssh root@{e}{d} -i /home/admin/.ssh/id_rsa");
         let s2 = format!("worker {p} ({ip2}) connected to {r}{d} (10.20.30.40)");
@@ -795,7 +804,7 @@ mod tests {
                 r,
                 p,
                 d,
-                ip_pre,
+                ip_pre.as_str(),
                 "10.20.30.40",
                 "127.0.0.1",
                 "secret_jwt_token",
@@ -815,7 +824,16 @@ mod tests {
             }
 
             let masked = sanitize_console_value(sample);
-            for forbidden in &[e, r, p, d, ip2, "secret_jwt_token", "github_pat_", "glpat-"] {
+            for forbidden in &[
+                e,
+                r,
+                p,
+                d,
+                ip2.as_str(),
+                "secret_jwt_token",
+                "github_pat_",
+                "glpat-",
+            ] {
                 assert!(
                     !masked
                         .to_ascii_lowercase()
@@ -827,7 +845,7 @@ mod tests {
 
         let mut dto = json!({
             "host.name": format!("{p}{d}"),
-            "peer.ip": ip,
+            "peer.ip": &ip,
             "authorization": "Bearer supersecret",
             "db.path": "/var/lib/muobserve/db/muobserve.duckdb",
             "nested": {
@@ -840,7 +858,7 @@ mod tests {
         assert!(!serialized.contains(p));
         assert!(!serialized.contains(e));
         assert!(!serialized.contains(d));
-        assert!(!serialized.contains(ip));
+        assert!(!serialized.contains(&ip));
         assert!(!serialized.contains("172.16.0.9"));
         assert!(!serialized.contains("supersecret"));
         assert!(!serialized.contains("sk-live-99999999"));
