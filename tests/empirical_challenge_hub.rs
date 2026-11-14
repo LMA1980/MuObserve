@@ -20,6 +20,8 @@ use mu_observable_ipc::{OtelLogEntry, OtelSpanEntry};
 use std::time::Duration;
 use tower::ServiceExt;
 
+static ADMIN_TOKEN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Helper to spin up a mock HTTP/1.1 upstream server on a given port (0 for ephemeral port).
 async fn spawn_mock_upstream(
     port: u16,
@@ -1312,6 +1314,14 @@ async fn test_empirical_ingress_hardening_loop_auth_body_limit_ssrf() {
 
     // 2. Admin authentication and SSRF validation on POST /api/v1/ingress/routes
     // 2a. Missing Bearer auth -> 401 Unauthorized
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let prev_admin = std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN").ok();
+    let prev_op = std::env::var("MUOBSERVE_OPERATOR_TOKEN").ok();
+    let prev_bearer = std::env::var("MUOBSERVE_BEARER_TOKEN").ok();
+    std::env::remove_var("MUOBSERVE_INGRESS_ADMIN_TOKEN");
+    std::env::remove_var("MUOBSERVE_OPERATOR_TOKEN");
+    std::env::remove_var("MUOBSERVE_BEARER_TOKEN");
+
     let unauth_req = Request::builder()
         .method("POST")
         .uri("/api/v1/ingress/routes")
@@ -1322,6 +1332,35 @@ async fn test_empirical_ingress_hardening_loop_auth_body_limit_ssrf() {
         .unwrap();
     let unauth_resp = router.clone().oneshot(unauth_req).await.unwrap();
     assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2a-bis. Unset admin env vars + non-empty Bearer token -> MUST fail closed with 401
+    let fail_closed_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"route_id":"r1","path_prefix":"/test/","upstream_url":"http://127.0.0.1:8000"}"#,
+        ))
+        .unwrap();
+    let fail_closed_resp = router.clone().oneshot(fail_closed_req).await.unwrap();
+    assert_eq!(fail_closed_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2a-ter. Empty string admin env var + non-empty Bearer token -> MUST fail closed with 401
+    std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", "");
+    let empty_env_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ingress/routes")
+        .header("authorization", "Bearer test-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"route_id":"r1","path_prefix":"/test/","upstream_url":"http://127.0.0.1:8000"}"#,
+        ))
+        .unwrap();
+    let empty_env_resp = router.clone().oneshot(empty_env_req).await.unwrap();
+    assert_eq!(empty_env_resp.status(), StatusCode::UNAUTHORIZED);
+
+    std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", "test-admin-token");
 
     // 2b. SSRF block on cloud metadata IP 169.254.169.254 -> 400 Bad Request
     let ssrf_req = Request::builder()
@@ -1365,6 +1404,16 @@ async fn test_empirical_ingress_hardening_loop_auth_body_limit_ssrf() {
         .body(Body::from(r#"{"route_id":"r-valid","path_prefix":"/test-service/","upstream_url":"http://127.0.0.1:8000","auth_required":true}"#))
         .unwrap();
     let valid_resp = router.clone().oneshot(valid_req).await.unwrap();
+    match prev_admin {
+        Some(v) => std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", v),
+        None => std::env::remove_var("MUOBSERVE_INGRESS_ADMIN_TOKEN"),
+    }
+    if let Some(v) = prev_op {
+        std::env::set_var("MUOBSERVE_OPERATOR_TOKEN", v);
+    }
+    if let Some(v) = prev_bearer {
+        std::env::set_var("MUOBSERVE_BEARER_TOKEN", v);
+    }
     assert_eq!(valid_resp.status(), StatusCode::CREATED);
 }
 
@@ -1420,4 +1469,435 @@ async fn test_empirical_log_search_sql_pushdown_and_comparison_operators() {
         .unwrap();
     let facets_resp = router.clone().oneshot(facets_req).await.unwrap();
     assert_eq!(facets_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_issue_80_82_sse_problem_parity_and_ingress_segment_boundaries() {
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let engine = IngressEngine::new(store.clone(), "node-a".into());
+
+    // 1. Segment boundary matching (#82)
+    assert_eq!(
+        engine
+            .match_route("/api/ci")
+            .await
+            .expect("/api/ci")
+            .route_id,
+        "route-ci"
+    );
+    assert_eq!(
+        engine
+            .match_route("/api/ci/")
+            .await
+            .expect("/api/ci/")
+            .route_id,
+        "route-ci"
+    );
+    assert_eq!(
+        engine
+            .match_route("/api/ci/jobs")
+            .await
+            .expect("/api/ci/jobs")
+            .route_id,
+        "route-ci"
+    );
+    assert!(
+        engine.match_route("/api/cibypass").await.is_none(),
+        "/api/cibypass must NOT match /api/ci/ route"
+    );
+
+    // 2. strip_prefix handles boundary request (/api/strip) and subpath (/api/strip/jobs) (#80)
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind echo upstream");
+    let upstream_port = listener.local_addr().expect("local addr").port();
+    let echo_handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let io = TokioIo::new(stream);
+            tokio::spawn(async move {
+                let service = service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let body = serde_json::json!({
+                            "path": req.uri().path(),
+                            "query": req.uri().query(),
+                        })
+                        .to_string();
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    },
+                );
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+
+    engine.add_route(
+        "route-strip",
+        "/api/strip/",
+        &format!("http://127.0.0.1:{upstream_port}"),
+        "strip-svc",
+        true,
+        false,
+    );
+
+    let root_req = Request::builder()
+        .method("GET")
+        .uri("/api/strip")
+        .body(Body::empty())
+        .unwrap();
+    let root_resp = engine.proxy_request(root_req).await.expect("proxy root");
+    assert_eq!(root_resp.status(), StatusCode::OK);
+    let root_bytes = root_resp.into_body().collect().await.unwrap().to_bytes();
+    let root_json: serde_json::Value = serde_json::from_slice(&root_bytes).unwrap();
+    assert_eq!(root_json["path"], "/");
+
+    let sub_req = Request::builder()
+        .method("GET")
+        .uri("/api/strip/jobs")
+        .body(Body::empty())
+        .unwrap();
+    let sub_resp = engine.proxy_request(sub_req).await.expect("proxy subpath");
+    assert_eq!(sub_resp.status(), StatusCode::OK);
+    let sub_bytes = sub_resp.into_body().collect().await.unwrap().to_bytes();
+    let sub_json: serde_json::Value = serde_json::from_slice(&sub_bytes).unwrap();
+    assert_eq!(sub_json["path"], "/jobs");
+
+    echo_handle.abort();
+
+    // 3. SSE /api/v1/events problem_opened has populated ai_diagnosis matching GET /api/v1/problems (#80)
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos() as i64;
+    let trace_id = "trace-issue80-parity";
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: trace_id.into(),
+                span_id: "s80-root".into(),
+                parent_span_id: None,
+                service_name: "mu-ingress".into(),
+                node_id: "node-a".into(),
+                span_name: "GET /api/orders".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ns - 5_000_000_000,
+                end_time_unix_nano: now_ns,
+                duration_ns: 5_000_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("upstream timeout".into()),
+                attributes_json: "{}".into(),
+            },
+            OtelSpanEntry {
+                trace_id: trace_id.into(),
+                span_id: "s80-db".into(),
+                parent_span_id: Some("s80-root".into()),
+                service_name: "inventory-db".into(),
+                node_id: "node-b".into(),
+                span_name: "SELECT orders".into(),
+                span_kind: "CLIENT".into(),
+                start_time_unix_nano: now_ns - 4_800_000_000,
+                end_time_unix_nano: now_ns - 100_000_000,
+                duration_ns: 4_700_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("connection pool exhausted".into()),
+                attributes_json: "{}".into(),
+            },
+        ])
+        .expect("insert spans");
+    store
+        .insert_logs_batch(&[OtelLogEntry {
+            timestamp_unix_nano: now_ns - 200_000_000,
+            trace_id: trace_id.into(),
+            span_id: "s80-db".into(),
+            severity_number: 21,
+            severity_text: "FATAL".into(),
+            body: "FATAL: connection pool exhausted in inventory-db".into(),
+            service_name: "inventory-db".into(),
+            node_id: "node-b".into(),
+            job_id: None,
+            stage_id: None,
+            attributes_json: "{}".into(),
+        }])
+        .expect("insert logs");
+
+    let router = build_console_api_router(store.clone());
+
+    let probs_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/problems")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(probs_resp.status(), StatusCode::OK);
+    let probs_bytes = probs_resp.into_body().collect().await.unwrap().to_bytes();
+    let probs_json: serde_json::Value = serde_json::from_slice(&probs_bytes).unwrap();
+    let probs_arr = probs_json["problems"].as_array().expect("problems array");
+    let expected_prob = probs_arr
+        .iter()
+        .find(|p| p["impacted_entity"] == "mu-ingress")
+        .expect("mu-ingress problem in GET /api/v1/problems");
+    let expected_diag = expected_prob["ai_diagnosis"]
+        .as_str()
+        .expect("ai_diagnosis populated in GET /api/v1/problems");
+    assert!(!expected_diag.is_empty());
+
+    let sse_resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_body = sse_resp.into_body();
+    let mut sse_buf = String::new();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(Ok(frame)) = sse_body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                sse_buf.push_str(&String::from_utf8_lossy(data));
+                if sse_buf.contains("mu-ingress") && sse_buf.contains("ai_diagnosis") {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+
+    let mut matched_diag: Option<String> = None;
+    for chunk in sse_buf.split("\n\n") {
+        if chunk.contains("event: problem_opened") {
+            if let Some(data_line) = chunk.lines().find(|l| l.starts_with("data:")) {
+                let payload = data_line.trim_start_matches("data:").trim();
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
+                    if val["impacted_entity"] == "mu-ingress" {
+                        matched_diag = val["ai_diagnosis"].as_str().map(str::to_owned);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        matched_diag.as_deref(),
+        Some(expected_diag),
+        "SSE problem_opened ai_diagnosis must match GET /api/v1/problems; raw SSE:\n{sse_buf}"
+    );
+}
+
+#[tokio::test]
+async fn test_issue_83_log_token_sql_pushdown_comparators_and_facets() {
+    let store_cmp = HotDuckDbStore::open_in_memory().expect("open cmp store");
+    let base_ns = 1_700_000_000_000_000_000i64;
+    let cmp_entry = OtelLogEntry {
+        timestamp_unix_nano: base_ns,
+        trace_id: "tr-cmp-1".into(),
+        span_id: "sp-cmp-1".into(),
+        severity_number: 13,
+        severity_text: "WARN".into(),
+        service_name: "cmp-svc".into(),
+        node_id: "node-a".into(),
+        body: "Metrics: a<=5 b>=5 c>5 d<5 e=5 count<=5 status=failed".into(),
+        attributes_json: r#"{"line_no":1,"stream":1}"#.into(),
+        job_id: Some("job-cmp".into()),
+        stage_id: Some("stage-1".into()),
+    };
+    let banner_entry = OtelLogEntry {
+        timestamp_unix_nano: base_ns + 1_000,
+        trace_id: "tr-banner-1".into(),
+        span_id: "sp-banner-1".into(),
+        severity_number: 9,
+        severity_text: "INFO".into(),
+        service_name: "cmp-svc".into(),
+        node_id: "node-a".into(),
+        body: "======== section ========".into(),
+        attributes_json: r#"{"line_no":2,"stream":1}"#.into(),
+        job_id: Some("job-cmp".into()),
+        stage_id: Some("stage-1".into()),
+    };
+
+    let banner_tokens = tokenize_log_line(&banner_entry, &banner_entry.body);
+    assert!(
+        !banner_tokens.iter().any(|t| t.contains('=')),
+        "Banner separator must not produce '=' tokens: {banner_tokens:?}"
+    );
+
+    store_cmp
+        .insert_logs(&[cmp_entry, banner_entry])
+        .expect("insert comparator logs");
+
+    for q in [
+        "a<=5",
+        "b>=5",
+        "c>5",
+        "d<5",
+        "e=5",
+        "count<=5",
+        "status=failed",
+        "<=5",
+        ">=5",
+        ">5",
+        "<5",
+        "=5",
+        "failed",
+    ] {
+        let hits = store_cmp
+            .search_logs_by_token_filtered(q, None, None, None, None, None, None, 10)
+            .expect("search comparator token");
+        assert_eq!(
+            hits.len(),
+            1,
+            "Expected exactly 1 match for comparator query '{q}', got {hits:?}"
+        );
+        assert_eq!(hits[0].trace_id, "tr-cmp-1");
+    }
+
+    // SQL filter pushdown on /api/v1/logs and /api/v1/logs/facets
+    let store = HotDuckDbStore::open_in_memory().expect("open pushdown store");
+    let mut batch = Vec::with_capacity(452);
+    for i in 0..2 {
+        batch.push(OtelLogEntry {
+            timestamp_unix_nano: base_ns + (i as i64) * 1_000_000,
+            trace_id: "tr-old-needle".into(),
+            span_id: format!("sp-old-{i}"),
+            severity_number: 17,
+            severity_text: "ERROR".into(),
+            service_name: "TargetSvc".into(),
+            node_id: "node-a".into(),
+            body: format!("failure pushdown_needle fatal #{i}"),
+            attributes_json: "{}".into(),
+            job_id: None,
+            stage_id: None,
+        });
+    }
+    for i in 0..450 {
+        batch.push(OtelLogEntry {
+            timestamp_unix_nano: base_ns + ((1_000 + i) as i64) * 1_000_000,
+            trace_id: format!("tr-other-{i}"),
+            span_id: format!("sp-other-{i}"),
+            severity_number: 9,
+            severity_text: "INFO".into(),
+            service_name: "other-svc".into(),
+            node_id: "node-b".into(),
+            body: format!("background pushdown_needle ok #{i}"),
+            attributes_json: "{}".into(),
+            job_id: None,
+            stage_id: None,
+        });
+    }
+    store.insert_logs(&batch).expect("insert 452 logs");
+
+    let router = build_console_api_router(store);
+
+    // Filtered logs must push down severity, case-insensitive service, and trace_id past 450 newer noise rows
+    let logs_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/logs?q=pushdown_needle&severity=error&service=targetsvc&trace_id=tr-old-needle&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs_resp.status(), StatusCode::OK);
+    let logs_bytes = logs_resp.into_body().collect().await.unwrap().to_bytes();
+    let logs_json: serde_json::Value = serde_json::from_slice(&logs_bytes).unwrap();
+    assert_eq!(logs_json["total"], 2);
+    let log_arr = logs_json["logs"].as_array().unwrap();
+    assert_eq!(log_arr.len(), 2);
+    assert!(log_arr
+        .iter()
+        .all(|l| l["trace_id"] == "tr-old-needle" && l["service_name"] == "TargetSvc"));
+
+    // Filtered facets must agree on count = 2 across total_count, services, levels, and histogram
+    let filtered_facets_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/logs/facets?severity=error&service=targetsvc&trace_id=tr-old-needle")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered_facets_resp.status(), StatusCode::OK);
+    let ff_bytes = filtered_facets_resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let ff_json: serde_json::Value = serde_json::from_slice(&ff_bytes).unwrap();
+    assert_eq!(ff_json["total_count"], 2);
+    assert_eq!(ff_json["services"][0]["name"], "TargetSvc");
+    assert_eq!(ff_json["services"][0]["count"], 2);
+    assert_eq!(ff_json["levels"][0]["name"], "ERROR");
+    assert_eq!(ff_json["levels"][0]["count"], 2);
+    let hist_sum: u64 = ff_json["histogram"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["count"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(hist_sum, 2);
+
+    // Non-empty queries that tokenize to zero indexable tokens must return empty facets (0), not unfiltered all-rows
+    for empty_q in ["x", "-", "===="] {
+        let empty_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/logs/facets?q={empty_q}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_resp.status(), StatusCode::OK);
+        let eb = empty_resp.into_body().collect().await.unwrap().to_bytes();
+        let ej: serde_json::Value = serde_json::from_slice(&eb).unwrap();
+        assert_eq!(ej["total_count"], 0, "query '{empty_q}' must return 0");
+        assert!(ej["services"].as_array().unwrap().is_empty());
+        assert!(ej["levels"].as_array().unwrap().is_empty());
+    }
+
+    // Unfiltered facets see all 452 rows
+    let all_resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/logs/facets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(all_resp.status(), StatusCode::OK);
+    let ab = all_resp.into_body().collect().await.unwrap().to_bytes();
+    let aj: serde_json::Value = serde_json::from_slice(&ab).unwrap();
+    assert_eq!(aj["total_count"], 452);
 }

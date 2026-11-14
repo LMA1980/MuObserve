@@ -385,7 +385,14 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
     assert_eq!(overview_val["routes"].as_array().unwrap().len(), 5);
     assert!(overview_val["tls_health"].is_null());
 
-    // Dynamically update TLS health via POST /api/v1/ingress/tls
+    // Fail closed when admin Bearer env tokens are unset
+    let prev_admin = std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN").ok();
+    let prev_op = std::env::var("MUOBSERVE_OPERATOR_TOKEN").ok();
+    let prev_bearer = std::env::var("MUOBSERVE_BEARER_TOKEN").ok();
+    std::env::remove_var("MUOBSERVE_INGRESS_ADMIN_TOKEN");
+    std::env::remove_var("MUOBSERVE_OPERATOR_TOKEN");
+    std::env::remove_var("MUOBSERVE_BEARER_TOKEN");
+
     let tls_payload = serde_json::json!({
         "domain": "console.k3.internal",
         "certificate_issuer": "step-ca intermediate",
@@ -395,6 +402,23 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
         "ocsp_stapling": true,
         "mutual_tls": true
     });
+    let fail_closed_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingress/tls")
+                .header("authorization", "Bearer test-admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&tls_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fail_closed_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Dynamically update TLS health via POST /api/v1/ingress/tls with configured admin token
+    std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", "test-admin-token");
     let post_resp = app
         .clone()
         .oneshot(
@@ -408,6 +432,16 @@ async fn test_m6_readonly_observability_apis_end_to_end() {
         )
         .await
         .unwrap();
+    match prev_admin {
+        Some(v) => std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", v),
+        None => std::env::remove_var("MUOBSERVE_INGRESS_ADMIN_TOKEN"),
+    }
+    if let Some(v) = prev_op {
+        std::env::set_var("MUOBSERVE_OPERATOR_TOKEN", v);
+    }
+    if let Some(v) = prev_bearer {
+        std::env::set_var("MUOBSERVE_BEARER_TOKEN", v);
+    }
     assert_eq!(post_resp.status(), StatusCode::OK);
 
     let (_, _, overview_updated) = get_json(&app, "/api/v1/ingress/overview").await;

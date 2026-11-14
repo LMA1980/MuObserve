@@ -394,34 +394,14 @@ async fn handle_get_smartscape(
     }
 }
 
-async fn handle_get_problems(
-    State(store): State<HotDuckDbStore>,
-    q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
-) -> Response {
-    let Query(params) = match q_res {
-        Ok(q) => q,
-        Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
-    };
-    let window_secs = match params.window_secs {
-        Some(0) | Some(604_801..) => {
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                "window_secs must be between 1 and 604800",
-            )
-        }
-        Some(w) => w,
-        None => DEFAULT_SMARTSCAPE_WINDOW_SECS,
-    };
-
+async fn collect_causal_problem_cards(
+    store: &HotDuckDbStore,
+    window_secs: u64,
+) -> Result<Vec<crate::analytics::causal::CausalProblemCard>, MuObserveError> {
     let causal_problems =
-        match crate::analytics::causal::compute_causal_problems(&store, window_secs, None) {
-            Ok(p) => p,
-            Err(e) => {
-                return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-            }
-        };
+        crate::analytics::causal::compute_causal_problems(store, window_secs, None)?;
 
-    let deterministic_feed = evaluate_deterministic_problems(&store, window_secs, None).ok();
+    let deterministic_feed = evaluate_deterministic_problems(store, window_secs, None).ok();
     let mut all_problems = causal_problems;
     if let Some(feed) = deterministic_feed {
         for dp in feed.problems {
@@ -470,6 +450,33 @@ async fn handle_get_problems(
         p.ai_diagnosis = Some(ai);
     }
 
+    Ok(all_problems)
+}
+
+async fn handle_get_problems(
+    State(store): State<HotDuckDbStore>,
+    q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match q_res {
+        Ok(q) => q,
+        Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let window_secs = match params.window_secs {
+        Some(0) | Some(604_801..) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "window_secs must be between 1 and 604800",
+            )
+        }
+        Some(w) => w,
+        None => DEFAULT_SMARTSCAPE_WINDOW_SECS,
+    };
+
+    let all_problems = match collect_causal_problem_cards(&store, window_secs).await {
+        Ok(p) => p,
+        Err(e) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
     let resp = crate::analytics::causal::CausalProblemsFeedResponse {
         window_secs,
         open_count: all_problems.len(),
@@ -481,12 +488,9 @@ async fn handle_get_problems(
 }
 
 async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> Response {
-    let initial_problems = crate::analytics::causal::compute_causal_problems(
-        &store,
-        DEFAULT_SMARTSCAPE_WINDOW_SECS,
-        None,
-    )
-    .unwrap_or_default();
+    let initial_problems = collect_causal_problem_cards(&store, DEFAULT_SMARTSCAPE_WINDOW_SECS)
+        .await
+        .unwrap_or_default();
 
     let mut initial_events = VecDeque::new();
     for card in &initial_problems {
@@ -693,21 +697,17 @@ fn validate_admin_auth(headers: &axum::http::HeaderMap) -> Option<&'static str> 
         })
         .map(str::trim);
 
-    let expected = std::env::var("MUOBSERVE_INGRESS_ADMIN_TOKEN")
-        .or_else(|_| std::env::var("MUOBSERVE_OPERATOR_TOKEN"))
-        .or_else(|_| std::env::var("MUOBSERVE_BEARER_TOKEN"));
+    let expected = crate::ingress::non_empty_env("MUOBSERVE_INGRESS_ADMIN_TOKEN")
+        .or_else(|| crate::ingress::non_empty_env("MUOBSERVE_OPERATOR_TOKEN"))
+        .or_else(|| crate::ingress::non_empty_env("MUOBSERVE_BEARER_TOKEN"));
 
     match (token, expected) {
-        (Some(presented), Ok(exp)) if !exp.is_empty() => {
+        (Some(presented), Some(exp)) if !presented.is_empty() => {
             if crate::ingress::constant_time_eq(presented.as_bytes(), exp.as_bytes()) {
                 None
             } else {
                 Some("Unauthorized: invalid Ingress admin Bearer token")
             }
-        }
-        (Some(presented), Err(_)) if !presented.is_empty() => {
-            // When no admin token is explicitly configured in environment, require any non-empty bearer token
-            None
         }
         _ => Some("Unauthorized: Ingress admin Bearer token required"),
     }
@@ -806,11 +806,196 @@ async fn handle_ingress_fallback(
 pub struct LogFacetsParams {
     pub q: Option<String>,
     pub token: Option<String>,
+    pub severity: Option<String>,
     pub service: Option<String>,
+    pub trace_id: Option<String>,
     pub job_id: Option<String>,
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub step_ms: Option<u64>,
+}
+
+type SevRange = (i32, i32, &'static str);
+
+fn parse_severity_filter(raw: Option<&str>) -> Result<(String, Option<SevRange>), &'static str> {
+    let sev_norm = raw.unwrap_or("all").trim().to_ascii_lowercase();
+    let range = match sev_norm.as_str() {
+        "" | "all" => None,
+        "error" | "errors" | "fatal" => Some((17, 24, "ERROR")),
+        "warn" | "warning" => Some((13, 16, "WARN")),
+        "info" => Some((9, 12, "INFO")),
+        "debug" | "trace" => Some((1, 8, "DEBUG")),
+        _ => return Err("Invalid severity filter; expected one of: all, error, warn, info, debug"),
+    };
+    Ok((sev_norm, range))
+}
+
+const LOG_FACET_BASE_WHERE: &str = r#"
+    timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+    AND (?3 IS NULL OR LOWER(service_name) = LOWER(?3))
+    AND (?4 IS NULL OR job_id = ?4)
+    AND (?5 IS NULL OR trace_id = ?5)
+    AND (?6 IS NULL OR (severity_number >= ?6 AND severity_number <= ?7) OR UPPER(severity_text) = ?8 OR (?8 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?8 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?8 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
+"#;
+
+struct FacetSqlFilter<'a> {
+    from_ns: i64,
+    to_ns: i64,
+    service: &'a Option<String>,
+    job_id: &'a Option<String>,
+    trace_id: &'a Option<String>,
+    min_sev: Option<i32>,
+    max_sev: Option<i32>,
+    sev_text: Option<&'a str>,
+    hashes: Option<&'a [u64]>,
+}
+
+impl<'a> FacetSqlFilter<'a> {
+    fn where_clause(&self, hash_param_start: usize) -> String {
+        match self.hashes {
+            Some(hv) => {
+                let placeholders = (hash_param_start..hash_param_start + hv.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{LOG_FACET_BASE_WHERE} AND dedup_hash IN ({placeholders})")
+            }
+            None => LOG_FACET_BASE_WHERE.to_string(),
+        }
+    }
+
+    fn push_base_params<'b>(&'b self, out: &mut Vec<&'b dyn duckdb::types::ToSql>) {
+        out.push(&self.from_ns);
+        out.push(&self.to_ns);
+        out.push(self.service);
+        out.push(self.job_id);
+        out.push(self.trace_id);
+        out.push(&self.min_sev);
+        out.push(&self.max_sev);
+        out.push(&self.sev_text);
+    }
+
+    fn push_hash_params<'b>(&'b self, out: &mut Vec<&'b dyn duckdb::types::ToSql>) {
+        if let Some(hv) = self.hashes {
+            for h in hv {
+                out.push(h);
+            }
+        }
+    }
+}
+
+fn query_log_facets_data(
+    conn: &duckdb::Connection,
+    filter: &FacetSqlFilter<'_>,
+    step_ms: u64,
+    step_ns: i64,
+    redactor: &PrivacyRedactor,
+) -> LogFacetsResponse {
+    let base_where = filter.where_clause(9);
+    let mut base_params: Vec<&dyn duckdb::types::ToSql> =
+        Vec::with_capacity(8 + filter.hashes.map_or(0, |h| h.len()));
+    filter.push_base_params(&mut base_params);
+    filter.push_hash_params(&mut base_params);
+
+    // Query 1: total_count
+    let count_sql = format!("SELECT COUNT(*) FROM v_logs WHERE {base_where}");
+    let total_count: u64 = conn
+        .query_row(&count_sql, &base_params[..], |r| r.get(0))
+        .unwrap_or(0);
+
+    // Query 2: services
+    let mut services = Vec::new();
+    let svc_sql = format!(
+        "SELECT service_name, COUNT(*) AS cnt FROM v_logs WHERE {base_where} GROUP BY service_name ORDER BY cnt DESC LIMIT 50"
+    );
+    if let Ok(mut stmt) = conn.prepare(&svc_sql) {
+        if let Ok(rows) = stmt.query_map(&base_params[..], |r| {
+            let raw_svc: String = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok(FacetCount {
+                name: redactor.redact_str(&raw_svc),
+                count: count.max(0) as u64,
+            })
+        }) {
+            for r in rows.flatten() {
+                services.push(r);
+            }
+        }
+    }
+
+    // Query 3: levels
+    let mut levels = Vec::new();
+    let lvl_sql = format!(
+        "SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt FROM v_logs WHERE {base_where} GROUP BY lvl ORDER BY cnt DESC"
+    );
+    if let Ok(mut stmt) = conn.prepare(&lvl_sql) {
+        if let Ok(rows) = stmt.query_map(&base_params[..], |r| {
+            let lvl: String = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok(FacetCount {
+                name: lvl,
+                count: count.max(0) as u64,
+            })
+        }) {
+            for r in rows.flatten() {
+                levels.push(r);
+            }
+        }
+    }
+
+    // Query 4: histogram
+    let step_ms_i64 = step_ms as i64;
+    let hist_where = filter.where_clause(11);
+    let hist_sql = format!(
+        r#"
+        SELECT
+            (timestamp_unix_nano / ?9) * ?10 AS bucket_ts,
+            COUNT(*) AS total_cnt,
+            SUM(CASE WHEN severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL') THEN 1 ELSE 0 END) AS err_cnt,
+            SUM(CASE WHEN (severity_number >= 13 AND severity_number < 17) OR UPPER(severity_text) IN ('WARN', 'WARNING') THEN 1 ELSE 0 END) AS warn_cnt,
+            SUM(CASE WHEN severity_number < 13 OR UPPER(severity_text) IN ('INFO', 'DEBUG', 'TRACE') THEN 1 ELSE 0 END) AS info_cnt
+        FROM v_logs
+        WHERE {hist_where}
+        GROUP BY bucket_ts
+        ORDER BY bucket_ts ASC
+        LIMIT 500
+        "#
+    );
+    let mut hist_params: Vec<&dyn duckdb::types::ToSql> =
+        Vec::with_capacity(10 + filter.hashes.map_or(0, |h| h.len()));
+    filter.push_base_params(&mut hist_params);
+    hist_params.push(&step_ns);
+    hist_params.push(&step_ms_i64);
+    filter.push_hash_params(&mut hist_params);
+
+    let mut histogram = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(&hist_sql) {
+        if let Ok(rows) = stmt.query_map(&hist_params[..], |r| {
+            let b_ts: i64 = r.get(0)?;
+            let total: i64 = r.get(1)?;
+            let errs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let warns: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let infos: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+            Ok(LogHistogramBucket {
+                bucket_ts_ms: b_ts.max(0) as u64,
+                count: total.max(0) as u64,
+                error_count: errs.max(0) as u64,
+                warn_count: warns.max(0) as u64,
+                info_count: infos.max(0) as u64,
+            })
+        }) {
+            for r in rows.flatten() {
+                histogram.push(r);
+            }
+        }
+    }
+
+    LogFacetsResponse {
+        total_count,
+        services,
+        levels,
+        histogram,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -845,6 +1030,19 @@ async fn handle_get_log_facets(
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
+    let (_sev_norm, sev_range) = match parse_severity_filter(params.severity.as_deref()) {
+        Ok(res) => res,
+        Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
+    };
+
+    for val in [&params.service, &params.trace_id, &params.job_id]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(msg) = validate_safe_filter_token(val) {
+            return json_error_response(StatusCode::BAD_REQUEST, msg);
+        }
+    }
     if let Some(ref t) = params.token {
         for part in t.split_whitespace() {
             if let Err(e) = validate_safe_filter_token(part) {
@@ -868,6 +1066,17 @@ async fn handle_get_log_facets(
     let token_query = params.token.as_deref().or(params.q.as_deref());
     let candidate_hashes = if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
         match HotDuckDbStore::candidate_hashes_for_query_conn(&conn, tq, params.job_id.as_deref()) {
+            Ok(None) => {
+                return no_store_json(
+                    StatusCode::OK,
+                    &LogFacetsResponse {
+                        total_count: 0,
+                        services: Vec::new(),
+                        levels: Vec::new(),
+                        histogram: Vec::new(),
+                    },
+                );
+            }
             Ok(Some(hashes)) if hashes.is_empty() => {
                 return no_store_json(
                     StatusCode::OK,
@@ -879,7 +1088,7 @@ async fn handle_get_log_facets(
                     },
                 );
             }
-            Ok(opt) => opt,
+            Ok(Some(hashes)) => Some(hashes),
             Err(e) => {
                 return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
             }
@@ -899,285 +1108,25 @@ async fn handle_get_log_facets(
         .map(|t| t.max(0).saturating_mul(1_000_000))
         .unwrap_or(i64::MAX);
 
+    let (min_sev, max_sev, sev_text) = match sev_range {
+        Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
+        None => (None, None, None),
+    };
+
     let redactor = PrivacyRedactor::new();
     let hashes_vec: Option<Vec<u64>> = candidate_hashes.map(|set| set.into_iter().collect());
-
-    // Query 1: total_count
-    let total_count: u64 = if let Some(ref hv) = hashes_vec {
-        let placeholders = (5..=4 + hv.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT COUNT(*)
-            FROM v_logs
-            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-              AND (?3 IS NULL OR service_name = ?3)
-              AND (?4 IS NULL OR job_id = ?4)
-              AND dedup_hash IN ({placeholders})
-            "#
-        );
-        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(4 + hv.len());
-        p.push(&from_ns);
-        p.push(&to_ns);
-        p.push(&params.service);
-        p.push(&params.job_id);
-        for h in hv {
-            p.push(h);
-        }
-        conn.query_row(&sql, &p[..], |r| r.get(0)).unwrap_or(0)
-    } else {
-        conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM v_logs
-            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-              AND (?3 IS NULL OR service_name = ?3)
-              AND (?4 IS NULL OR job_id = ?4)
-            "#,
-            params![from_ns, to_ns, params.service, params.job_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
+    let filter = FacetSqlFilter {
+        from_ns,
+        to_ns,
+        service: &params.service,
+        job_id: &params.job_id,
+        trace_id: &params.trace_id,
+        min_sev,
+        max_sev,
+        sev_text,
+        hashes: hashes_vec.as_deref(),
     };
-
-    // Query 2: services
-    let mut services = Vec::new();
-    if let Some(ref hv) = hashes_vec {
-        let placeholders = (4..=3 + hv.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT service_name, COUNT(*) AS cnt
-            FROM v_logs
-            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-              AND (?3 IS NULL OR job_id = ?3)
-              AND dedup_hash IN ({placeholders})
-            GROUP BY service_name
-            ORDER BY cnt DESC
-            LIMIT 50
-            "#
-        );
-        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(3 + hv.len());
-        p.push(&from_ns);
-        p.push(&to_ns);
-        p.push(&params.job_id);
-        for h in hv {
-            p.push(h);
-        }
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(rows) = stmt.query_map(&p[..], |r| {
-                let raw_svc: String = r.get(0)?;
-                let count: i64 = r.get(1)?;
-                Ok(FacetCount {
-                    name: redactor.redact_str(&raw_svc),
-                    count: count.max(0) as u64,
-                })
-            }) {
-                for r in rows.flatten() {
-                    services.push(r);
-                }
-            }
-        }
-    } else if let Ok(mut svc_stmt) = conn.prepare(
-        r#"
-        SELECT service_name, COUNT(*) AS cnt
-        FROM v_logs
-        WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-          AND (?3 IS NULL OR job_id = ?3)
-        GROUP BY service_name
-        ORDER BY cnt DESC
-        LIMIT 50
-        "#,
-    ) {
-        if let Ok(rows) = svc_stmt.query_map(params![from_ns, to_ns, params.job_id], |r| {
-            let raw_svc: String = r.get(0)?;
-            let count: i64 = r.get(1)?;
-            Ok(FacetCount {
-                name: redactor.redact_str(&raw_svc),
-                count: count.max(0) as u64,
-            })
-        }) {
-            for r in rows.flatten() {
-                services.push(r);
-            }
-        }
-    }
-
-    // Query 3: levels
-    let mut levels = Vec::new();
-    if let Some(ref hv) = hashes_vec {
-        let placeholders = (5..=4 + hv.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt
-            FROM v_logs
-            WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-              AND (?3 IS NULL OR service_name = ?3)
-              AND (?4 IS NULL OR job_id = ?4)
-              AND dedup_hash IN ({placeholders})
-            GROUP BY lvl
-            ORDER BY cnt DESC
-            "#
-        );
-        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(4 + hv.len());
-        p.push(&from_ns);
-        p.push(&to_ns);
-        p.push(&params.service);
-        p.push(&params.job_id);
-        for h in hv {
-            p.push(h);
-        }
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(rows) = stmt.query_map(&p[..], |r| {
-                let lvl: String = r.get(0)?;
-                let count: i64 = r.get(1)?;
-                Ok(FacetCount {
-                    name: lvl,
-                    count: count.max(0) as u64,
-                })
-            }) {
-                for r in rows.flatten() {
-                    levels.push(r);
-                }
-            }
-        }
-    } else if let Ok(mut lvl_stmt) = conn.prepare(
-        r#"
-        SELECT UPPER(severity_text) AS lvl, COUNT(*) AS cnt
-        FROM v_logs
-        WHERE timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
-          AND (?3 IS NULL OR service_name = ?3)
-          AND (?4 IS NULL OR job_id = ?4)
-        GROUP BY lvl
-        ORDER BY cnt DESC
-        "#,
-    ) {
-        if let Ok(rows) = lvl_stmt.query_map(
-            params![from_ns, to_ns, params.service, params.job_id],
-            |r| {
-                let lvl: String = r.get(0)?;
-                let count: i64 = r.get(1)?;
-                Ok(FacetCount {
-                    name: lvl,
-                    count: count.max(0) as u64,
-                })
-            },
-        ) {
-            for r in rows.flatten() {
-                levels.push(r);
-            }
-        }
-    }
-
-    // Query 4: histogram
-    let step_ms_i64 = step_ms as i64;
-    let mut histogram = Vec::new();
-    if let Some(ref hv) = hashes_vec {
-        let placeholders = (7..=6 + hv.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT
-                (timestamp_unix_nano / ?1) * ?2 AS bucket_ts,
-                COUNT(*) AS total_cnt,
-                SUM(CASE WHEN severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL') THEN 1 ELSE 0 END) AS err_cnt,
-                SUM(CASE WHEN (severity_number >= 13 AND severity_number < 17) OR UPPER(severity_text) IN ('WARN', 'WARNING') THEN 1 ELSE 0 END) AS warn_cnt,
-                SUM(CASE WHEN severity_number < 13 OR UPPER(severity_text) IN ('INFO', 'DEBUG', 'TRACE') THEN 1 ELSE 0 END) AS info_cnt
-            FROM v_logs
-            WHERE timestamp_unix_nano >= ?3 AND timestamp_unix_nano <= ?4
-              AND (?5 IS NULL OR service_name = ?5)
-              AND (?6 IS NULL OR job_id = ?6)
-              AND dedup_hash IN ({placeholders})
-            GROUP BY bucket_ts
-            ORDER BY bucket_ts ASC
-            LIMIT 500
-            "#
-        );
-        let mut p: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(6 + hv.len());
-        p.push(&step_ns);
-        p.push(&step_ms_i64);
-        p.push(&from_ns);
-        p.push(&to_ns);
-        p.push(&params.service);
-        p.push(&params.job_id);
-        for h in hv {
-            p.push(h);
-        }
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(rows) = stmt.query_map(&p[..], |r| {
-                let b_ts: i64 = r.get(0)?;
-                let total: i64 = r.get(1)?;
-                let errs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                let warns: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                let infos: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                Ok(LogHistogramBucket {
-                    bucket_ts_ms: b_ts.max(0) as u64,
-                    count: total.max(0) as u64,
-                    error_count: errs.max(0) as u64,
-                    warn_count: warns.max(0) as u64,
-                    info_count: infos.max(0) as u64,
-                })
-            }) {
-                for r in rows.flatten() {
-                    histogram.push(r);
-                }
-            }
-        }
-    } else if let Ok(mut hist_stmt) = conn.prepare(
-        r#"
-        SELECT
-            (timestamp_unix_nano / ?1) * ?2 AS bucket_ts,
-            COUNT(*) AS total_cnt,
-            SUM(CASE WHEN severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL') THEN 1 ELSE 0 END) AS err_cnt,
-            SUM(CASE WHEN (severity_number >= 13 AND severity_number < 17) OR UPPER(severity_text) IN ('WARN', 'WARNING') THEN 1 ELSE 0 END) AS warn_cnt,
-            SUM(CASE WHEN severity_number < 13 OR UPPER(severity_text) IN ('INFO', 'DEBUG', 'TRACE') THEN 1 ELSE 0 END) AS info_cnt
-        FROM v_logs
-        WHERE timestamp_unix_nano >= ?3 AND timestamp_unix_nano <= ?4
-          AND (?5 IS NULL OR service_name = ?5)
-          AND (?6 IS NULL OR job_id = ?6)
-        GROUP BY bucket_ts
-        ORDER BY bucket_ts ASC
-        LIMIT 500
-        "#,
-    ) {
-        if let Ok(rows) = hist_stmt.query_map(
-            params![step_ns, step_ms as i64, from_ns, to_ns, params.service, params.job_id],
-            |r| {
-                let b_ts: i64 = r.get(0)?;
-                let total: i64 = r.get(1)?;
-                let errs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                let warns: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                let infos: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                Ok(LogHistogramBucket {
-                    bucket_ts_ms: b_ts.max(0) as u64,
-                    count: total.max(0) as u64,
-                    error_count: errs.max(0) as u64,
-                    warn_count: warns.max(0) as u64,
-                    info_count: infos.max(0) as u64,
-                })
-            },
-        ) {
-            for r in rows.flatten() {
-                histogram.push(r);
-            }
-        }
-    }
-
-    let resp = LogFacetsResponse {
-        total_count,
-        services,
-        levels,
-        histogram,
-    };
+    let resp = query_log_facets_data(&conn, &filter, step_ms, step_ns, &redactor);
 
     no_store_json(StatusCode::OK, &resp)
 }
@@ -1276,20 +1225,9 @@ async fn handle_get_logs(
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
-    let sev_raw = params.severity.as_deref().unwrap_or("all").trim();
-    let sev_norm = sev_raw.to_ascii_lowercase();
-    let min_sev_range: Option<(i32, i32, &str)> = match sev_norm.as_str() {
-        "" | "all" => None,
-        "error" | "errors" | "fatal" => Some((17, 24, "ERROR")),
-        "warn" | "warning" => Some((13, 16, "WARN")),
-        "info" => Some((9, 12, "INFO")),
-        "debug" | "trace" => Some((1, 8, "DEBUG")),
-        _ => {
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                "Invalid severity filter; expected one of: all, error, warn, info, debug",
-            )
-        }
+    let (sev_norm, min_sev_range) = match parse_severity_filter(params.severity.as_deref()) {
+        Ok(res) => res,
+        Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
     };
 
     if let Some(svc) = &params.service {
@@ -1465,24 +1403,16 @@ pub fn query_sanitized_logs_with_token_and_bounds(
     let bounded_limit = limit.clamp(1, max_cap);
 
     let mut logs = if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
-        let token_hits = store.search_logs_by_token(tq, job_id_filter, bounded_limit * 4)?;
-        token_hits
-            .into_iter()
-            .filter(|item| {
-                matches_severity(item, sev_range)
-                    && service_filter
-                        .map(|svc| item.service.eq_ignore_ascii_case(svc))
-                        .unwrap_or(true)
-                    && trace_id_filter
-                        .map(|tid| item.trace_id == tid)
-                        .unwrap_or(true)
-                    && from_ns
-                        .map(|f| item.timestamp_unix_nano >= f)
-                        .unwrap_or(true)
-                    && to_ns.map(|t| item.timestamp_unix_nano <= t).unwrap_or(true)
-            })
-            .take(bounded_limit)
-            .collect()
+        store.search_logs_by_token_filtered(
+            tq,
+            sev_range,
+            service_filter,
+            trace_id_filter,
+            job_id_filter,
+            from_ns,
+            to_ns,
+            bounded_limit,
+        )?
     } else {
         query_v_logs_rows(
             store,
@@ -1542,7 +1472,7 @@ fn query_v_logs_rows(
         FROM v_logs
         WHERE (?1 IS NULL OR trace_id = ?1)
           AND (?2 IS NULL OR job_id = ?2)
-          AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL'))
+          AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?5 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?5 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
           AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
           AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
           AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
@@ -1616,7 +1546,9 @@ fn matches_severity(item: &ConsoleLogItem, sev_range: Option<(i32, i32, &str)>) 
     };
     let num_matches = item.severity_number >= min_n && item.severity_number <= max_n;
     let text_matches = item.severity_text.eq_ignore_ascii_case(txt)
-        || (txt == "ERROR" && item.severity_text.eq_ignore_ascii_case("FATAL"));
+        || (txt == "ERROR" && item.severity_text.eq_ignore_ascii_case("FATAL"))
+        || (txt == "WARN" && item.severity_text.eq_ignore_ascii_case("WARNING"))
+        || (txt == "DEBUG" && item.severity_text.eq_ignore_ascii_case("TRACE"));
     num_matches || text_matches
 }
 
